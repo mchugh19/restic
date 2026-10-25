@@ -58,12 +58,20 @@ func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string
 			// target's directories are always listed.
 			continue
 		}
-		if abs, err := filepath.Abs(target); err == nil {
-			analysedRoots = append(analysedRoots, abs)
+		// Records and the configuration hash are keyed by the
+		// target's absolute form. Keying by the string as typed
+		// would let a spelling variant (a trailing slash, a "."
+		// component) miss the parent's record and cost a full
+		// walk; the absolute form is the identity the archiver
+		// and the recorded snapshot paths already use.
+		key, err := filepath.Abs(target)
+		if err != nil {
+			key = filepath.Clean(target)
 		}
-		hash := btrfsConfigHash(target, opts)
+		analysedRoots = append(analysedRoots, key)
+		hash := btrfsConfigHash(key, opts)
 		records = append(records, data.BtrfsProvenance{
-			Path:       target,
+			Path:       key,
 			SubvolUUID: info.SourceUUID,
 			Generation: info.SnapGeneration,
 			Complete:   true,
@@ -74,7 +82,7 @@ func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string
 		}
 		var prec *data.BtrfsProvenance
 		for i := range parent.Btrfs {
-			if parent.Btrfs[i].Path == target {
+			if parent.Btrfs[i].Path == key {
 				prec = &parent.Btrfs[i]
 				break
 			}
@@ -91,7 +99,7 @@ func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string
 			fail = "snapshot generation did not advance"
 		case prec.ConfigHash != hash:
 			fail = "backup configuration changed since the parent snapshot"
-		case !addSparseDirs(info, prec.Generation, target, listDirs, logf):
+		case !addSparseDirs(info, prec.Generation, key, bfs.ResolvedTarget(target), listDirs, logf):
 			fail = "" // addSparseDirs already logged the reason
 			sparseOK = false
 		}
@@ -115,7 +123,21 @@ func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string
 // target, plus every ancestor of a changed inode down to (and
 // including) the target root. Directories outside that set have no
 // changed descendants and are spliced from the parent tree.
-func addSparseDirs(info fs.BtrfsSnapInfo, gPrev uint64, target string, listDirs map[string]bool, logf func(string, ...interface{})) bool {
+//
+// The tree search speaks in physical paths inside the subvolume, so
+// filtering uses physTarget (the target with any symlink resolved);
+// listDirs is keyed by the spelled absolute form the archiver
+// visits, so results are translated back before insertion.
+func addSparseDirs(info fs.BtrfsSnapInfo, gPrev uint64, spelledAbs, physTarget string, listDirs map[string]bool, logf func(string, ...interface{})) bool {
+	toSpelled := func(p string) string {
+		if p == physTarget {
+			return spelledAbs
+		}
+		if strings.HasPrefix(p, physTarget+string(os.PathSeparator)) {
+			return spelledAbs + p[len(physTarget):]
+		}
+		return p
+	}
 	f, err := os.Open(info.SnapPath)
 	if err != nil {
 		logf("btrfs sparse scan: opening snapshot: %v, running full walk", err)
@@ -145,10 +167,6 @@ func addSparseDirs(info fs.BtrfsSnapInfo, gPrev uint64, target string, listDirs 
 		return false
 	}
 
-	absTarget, err := filepath.Abs(target)
-	if err != nil {
-		return false
-	}
 	for ino, it := range items {
 		if it.TransID <= gPrev && it.LeafStamp <= gPrev {
 			continue
@@ -163,17 +181,17 @@ func addSparseDirs(info fs.BtrfsSnapInfo, gPrev uint64, target string, listDirs 
 				continue // the subvolume root itself
 			}
 			abs := filepath.Join(info.SubvolRoot, filepath.FromSlash(p))
-			if abs != absTarget && !strings.HasPrefix(abs, absTarget+string(os.PathSeparator)) {
+			if abs != physTarget && !strings.HasPrefix(abs, physTarget+string(os.PathSeparator)) {
 				continue // belongs to a different target of this subvolume
 			}
 			if it.IsDir() {
-				listDirs[abs] = true
+				listDirs[toSpelled(abs)] = true
 			}
 			// Every ancestor down to the target root must be listed
 			// for the walk to reach this inode at all.
 			for d := filepath.Dir(abs); ; d = filepath.Dir(d) {
-				listDirs[d] = true
-				if d == absTarget || filepath.Dir(d) == d {
+				listDirs[toSpelled(d)] = true
+				if d == physTarget || filepath.Dir(d) == d {
 					break
 				}
 			}
