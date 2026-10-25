@@ -4,6 +4,7 @@ package fs
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,20 +103,15 @@ func showUint(kv map[string]string, key string) uint64 {
 	return n
 }
 
-// sweepStale removes restic-managed snapshots left next to root by
+// sweepStale removes restic-managed snapshots left inside root by
 // runs that were killed before their deferred cleanup could run. The
 // caller (a fresh run that is about to create its own snapshot) is the
 // only sweeper, so a live run's snapshots are never swept from under
 // it as long as runs do not overlap on the same subvolume.
-// sweepStale deletes leftover .restic-snap-* subvolumes next to root.
-// keep holds snapshot paths already created by this run (for other
-// subvolume roots sharing the same parent directory); those are not
-// stale and must never be swept. Getting this wrong silently drops a
-// sibling target's snapshot mid-run, so the keep set is load-bearing,
-// not defensive.
+// keep holds snapshot paths already created by this run; those are
+// not stale and must never be swept.
 func sweepStale(root string, msgError ErrorHandler, keep map[string]bool) {
-	parent := filepath.Dir(root)
-	entries, err := os.ReadDir(parent)
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return
 	}
@@ -123,7 +119,7 @@ func sweepStale(root string, msgError ErrorHandler, keep map[string]bool) {
 		if !strings.HasPrefix(e.Name(), ".restic-snap-") {
 			continue
 		}
-		p := filepath.Join(parent, e.Name())
+		p := filepath.Join(root, e.Name())
 		if keep[p] {
 			continue
 		}
@@ -185,11 +181,16 @@ func NewLocalBtrfs(targets []string, msgError ErrorHandler, msgMessage MessageHa
 		}
 		sweepStale(root, msgError, keep)
 
-		// The snapshot name carries the run's pid plus a per-root
-		// sequence number: sibling subvolume roots share a parent
-		// directory, and a pid-only name collides between them (the
-		// second create then fails, or worse, the name is reused).
-		snapPath := filepath.Join(filepath.Dir(root),
+		// The snapshot lives INSIDE the subvolume root, not next to
+		// it: the root may be a mountpoint whose parent directory is
+		// on a different filesystem (a top-level subvolume mounted
+		// at /srv/mirror, with /srv on ext4, is the common case),
+		// and btrfs snapshots must be created on the filesystem they
+		// snapshot. The name carries the run's pid plus a per-root
+		// sequence number so concurrent or sibling roots can never
+		// collide. The snapshot's placeholder entry inside its own
+		// tree is hidden by OpenFile when the root itself is listed.
+		snapPath := filepath.Join(root,
 			fmt.Sprintf(".restic-snap-%d-%d", os.Getpid(), len(lb.snaps)))
 		if err := exec.Command("btrfs", "subvolume", "snapshot", "-r", root, snapPath).Run(); err != nil {
 			return nil, fmt.Errorf("btrfs subvolume snapshot of %v: %w", root, err)
@@ -277,9 +278,57 @@ func (fs *LocalBtrfs) snapshotPath(name string) string {
 	return filepath.Join(fs.byRoot[best], rel)
 }
 
+// snapRootFile hides a snapshot's own placeholder entry from listings
+// of the snapshot root. The snapshot lives inside the source subvolume,
+// so the snapshot's tree contains its own name as an empty directory
+// (the usual nested-subvolume placeholder); it is not part of the
+// user's tree and must not be recorded when a target is the subvolume
+// root itself.
+type snapRootFile struct {
+	File
+	drop string
+}
+
+func (f *snapRootFile) Readdirnames(n int) ([]string, error) {
+	kept := func(names []string) []string {
+		out := names[:0]
+		for _, name := range names {
+			if name != f.drop {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+	if n <= 0 {
+		names, err := f.File.Readdirnames(n)
+		return kept(names), err
+	}
+	var out []string
+	for {
+		names, err := f.File.Readdirnames(n)
+		out = append(out, kept(names)...)
+		if err != nil || len(out) > 0 {
+			return out, err
+		}
+		if len(names) == 0 {
+			return out, io.EOF
+		}
+	}
+}
+
 // OpenFile wraps the OpenFile method of the underlying file system.
 func (fs *LocalBtrfs) OpenFile(name string, flag int, metadataOnly bool) (File, error) {
-	return fs.FS.OpenFile(fs.snapshotPath(name), flag, metadataOnly)
+	p := fs.snapshotPath(name)
+	file, err := fs.FS.OpenFile(p, flag, metadataOnly)
+	if err != nil {
+		return nil, err
+	}
+	for _, snap := range fs.byRoot {
+		if p == snap {
+			return &snapRootFile{File: file, drop: filepath.Base(snap)}, nil
+		}
+	}
+	return file, nil
 }
 
 // Lstat wraps the Lstat method of the underlying file system.
