@@ -30,7 +30,26 @@ type Snapshot struct {
 	ProgramVersion string           `json:"program_version,omitempty"`
 	Summary        *SnapshotSummary `json:"summary,omitempty"`
 
+	// Btrfs carries per-target btrfs provenance recorded by the
+	// btrfs-snapshot feature: the source subvolume UUID, the snapshot
+	// subvolume's generation, whether the tree is complete, and a hash
+	// of the backup configuration. Stock restic ignores the field; a
+	// stock binary that re-saves the snapshot drops it, which the
+	// sparse-scan guards treat as "no state" and fall back to a full
+	// walk.
+	Btrfs []BtrfsProvenance `json:"btrfs,omitempty"`
+
 	id *restic.ID // plaintext ID, used during restore
+}
+
+// BtrfsProvenance is the per-target state the generation-tracked
+// sparse scan (feature btrfs-sparse-scan) carries between runs.
+type BtrfsProvenance struct {
+	Path       string `json:"path"`
+	SubvolUUID string `json:"subvolume_uuid"`
+	Generation uint64 `json:"generation"`
+	Complete   bool   `json:"complete"`
+	ConfigHash string `json:"config_hash"`
 }
 
 type SnapshotSummary struct {
