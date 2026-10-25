@@ -45,9 +45,44 @@ type LocalBtrfs struct {
 	FS
 	snaps      []BtrfsSnapInfo
 	byRoot     map[string]string // source subvolume root -> snapshot path
+	links      map[string]string // absolute target as spelled -> resolved target
 	msgError   ErrorHandler
 	msgMessage MessageHandler
 	mutex      sync.Mutex
+}
+
+// resolveLinks rewrites the longest symlinked-target prefix of name
+// to its resolved form. Paths that do not pass through a symlinked
+// target are returned unchanged.
+func (fs *LocalBtrfs) resolveLinks(name string) string {
+	best := ""
+	for spelled := range fs.links {
+		if name == spelled || strings.HasPrefix(name, spelled+string(os.PathSeparator)) {
+			if len(spelled) > len(best) {
+				best = spelled
+			}
+		}
+	}
+	if best == "" {
+		return name
+	}
+	rel, err := filepath.Rel(best, name)
+	if err != nil {
+		return name
+	}
+	return filepath.Join(fs.links[best], rel)
+}
+
+// ResolvedTarget returns target in absolute form with a symlinked
+// target prefix resolved. The backup command uses it to address a
+// target inside its subvolume; records and plans stay keyed by the
+// spelled form (see ResolvedTarget's callers).
+func (fs *LocalBtrfs) ResolvedTarget(target string) string {
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return target
+	}
+	return fs.resolveLinks(abs)
 }
 
 // statically ensure that LocalBtrfs implements FS.
@@ -138,6 +173,7 @@ func NewLocalBtrfs(targets []string, msgError ErrorHandler, msgMessage MessageHa
 	lb := &LocalBtrfs{
 		FS:         NewLocal(),
 		byRoot:     make(map[string]string),
+		links:      make(map[string]string),
 		msgError:   msgError,
 		msgMessage: msgMessage,
 	}
@@ -147,6 +183,19 @@ func NewLocalBtrfs(targets []string, msgError ErrorHandler, msgMessage MessageHa
 		if err != nil {
 			return nil, err
 		}
+		// A target spelled through a symlink is resolved before
+		// anything looks at the filesystem: Statfs would follow the
+		// link, but the subvolume climb and the path translation work
+		// on literal prefixes, so without resolution the target's
+		// subvolume is never found. Recorded paths are unaffected;
+		// they always use the spelling the user gave.
+		resolved := abs
+		if r, err := filepath.EvalSymlinks(abs); err == nil {
+			resolved = r
+		}
+		if resolved != abs {
+			lb.links[abs] = resolved
+		}
 		// A target that is not on btrfs cannot be snapshotted; it is
 		// backed up live (the wrapper passes its paths through
 		// unchanged) and gets no provenance record. Mixed target lists
@@ -155,14 +204,14 @@ func NewLocalBtrfs(targets []string, msgError ErrorHandler, msgMessage MessageHa
 		// fails the run below: snapshotting was possible there and
 		// silently reading a changing tree would be worse than failing.
 		var stfs unix.Statfs_t
-		if err := unix.Statfs(abs, &stfs); err != nil {
+		if err := unix.Statfs(resolved, &stfs); err != nil {
 			return nil, err
 		}
 		if stfs.Type != btrfsSuperMagic {
 			msgMessage("btrfs: %v is not on a btrfs filesystem, backing it up without a snapshot", abs)
 			continue
 		}
-		root, err := subvolumeRoot(abs)
+		root, err := subvolumeRoot(resolved)
 		if err != nil {
 			return nil, err
 		}
@@ -228,6 +277,7 @@ func (fs *LocalBtrfs) InfoFor(target string) (BtrfsSnapInfo, bool) {
 	if err != nil {
 		return BtrfsSnapInfo{}, false
 	}
+	abs = fs.resolveLinks(abs)
 	best := -1
 	var info BtrfsSnapInfo
 	for _, s := range fs.snaps {
@@ -259,7 +309,7 @@ func (fs *LocalBtrfs) DeleteSnapshots() {
 // its subvolume. Paths outside every snapshotted subvolume pass
 // through unchanged.
 func (fs *LocalBtrfs) snapshotPath(name string) string {
-	clean := filepath.Clean(name)
+	clean := fs.resolveLinks(filepath.Clean(name))
 	best := ""
 	for root := range fs.byRoot {
 		if clean == root || strings.HasPrefix(clean, root+string(os.PathSeparator)) {
