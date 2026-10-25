@@ -23,6 +23,7 @@ import (
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/filter"
 	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/global"
@@ -133,8 +134,8 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.IgnoreCtime, "ignore-ctime", false, "ignore ctime changes when checking for modified files (default: $RESTIC_IGNORE_CTIME or false)")
 	f.BoolVarP(&opts.DryRun, "dry-run", "n", false, "do not upload or write any data, just show what would be done")
 	f.BoolVar(&opts.NoScan, "no-scan", false, "do not run scanner to estimate size of backup")
-	if runtime.GOOS == "windows" {
-		f.BoolVar(&opts.UseFsSnapshot, "use-fs-snapshot", false, "use filesystem snapshot where possible (currently only Windows VSS)")
+	if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
+		f.BoolVar(&opts.UseFsSnapshot, "use-fs-snapshot", false, "use filesystem snapshot where possible (Windows VSS, Linux btrfs with feature flag btrfs-snapshot)")
 	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		f.BoolVar(&opts.ExcludeCloudFiles, "exclude-cloud-files", false, "excludes online-only cloud files (such as OneDrive, iCloud drive, …)")
@@ -599,6 +600,31 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		targetFS = localVss
 	}
 
+	// btrfs snapshots on Linux, mirroring the VSS integration above:
+	// the backup command owns snapshot creation and deletion, the
+	// fs.LocalBtrfs wrapper translates paths so the archiver (and the
+	// recorded snapshot paths) only ever see the original targets.
+	var btrfsFS *fs.LocalBtrfs
+	var sparsePlan *archiver.SparsePlan
+	var btrfsRecords []data.BtrfsProvenance
+	if runtime.GOOS == "linux" && opts.UseFsSnapshot && feature.Flag.Enabled(feature.BtrfsSnapshot) {
+		errorHandler := func(item string, err error) {
+			_ = progressReporter.Error(item, err)
+		}
+		messageHandler := func(msg string, args ...interface{}) {
+			if !gopts.JSON {
+				printer.P(msg, args...)
+			}
+		}
+		var err error
+		btrfsFS, err = fs.NewLocalBtrfs(targets, errorHandler, messageHandler)
+		if err != nil {
+			return fmt.Errorf("creating btrfs snapshot: %w", err)
+		}
+		defer btrfsFS.DeleteSnapshots()
+		targetFS = btrfsFS
+	}
+
 	if opts.Stdin || opts.StdinCommand {
 		if !gopts.JSON {
 			printer.V("read data from stdin")
@@ -638,7 +664,22 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	cancelCtx, cancel := context.WithCancel(wgCtx)
 	defer cancel()
 
-	if !opts.NoScan {
+	if btrfsFS != nil {
+		btrfsRecords, sparsePlan = prepareBtrfsRun(btrfsFS, parentSnapshot, targets, opts,
+			func(format string, args ...interface{}) {
+				if !gopts.JSON {
+					printer.P(format, args...)
+				}
+			})
+		if sparsePlan != nil && !gopts.JSON {
+			printer.P("btrfs sparse scan: only changed directories will be walked\n")
+		}
+	}
+
+	// In sparse mode the scanner's full walk would eat the saving, so
+	// it is skipped like with --no-scan; totals then come from the
+	// archiver alone.
+	if !opts.NoScan && sparsePlan == nil {
 		sc := archiver.NewScanner(targetFS)
 		sc.SelectByName = selectByNameFilter
 		sc.Select = selectFilter
@@ -689,6 +730,8 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		ParentSnapshot:  parentSnapshot,
 		ProgramVersion:  "restic " + global.Version,
 		SkipIfUnchanged: opts.SkipIfUnchanged,
+		SparsePlan:      sparsePlan,
+		BtrfsRecords:    btrfsRecords,
 	}
 
 	if !gopts.JSON {
