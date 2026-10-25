@@ -101,6 +101,12 @@ type Archiver struct {
 	mu        sync.Mutex
 	summary   *Summary
 
+	// sparsePlan, when set by Snapshot(), restricts directory listing
+	// to the directories the btrfs changed set requires (feature
+	// btrfs-sparse-scan); all other directories reuse their parent
+	// subtree without being opened.
+	sparsePlan *SparsePlan
+
 	// Error is called for all errors that occur during backup.
 	Error ErrorFunc
 
@@ -588,6 +594,33 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 	case fi.Mode.IsDir():
 		debug.Log("  %v dir", target)
 
+		// btrfs sparse scan: a directory outside the changed set keeps
+		// its parent subtree verbatim and is never opened. Its inode
+		// item did not change (the fs wrapper already statted it above),
+		// so a node built from the current stat is identical to the one
+		// a full walk would build.
+		if arch.sparsePlan != nil && previous != nil && previous.Subtree != nil &&
+			arch.sparsePlan.Covers(abstarget) &&
+			!arch.sparsePlan.ListDirs[abstarget] {
+			// build the node exactly as saveDir would (it calls
+			// MakeReadable before nodeFromFileInfo)
+			if err := meta.MakeReadable(); err != nil {
+				return futureNode{}, false, err
+			}
+			node, err := arch.nodeFromFileInfo(snPath, target, meta, false)
+			if err != nil {
+				return futureNode{}, false, err
+			}
+			node.Subtree = previous.Subtree
+			arch.trackItem(snPath+"/", previous, node, ItemStats{}, time.Since(start))
+			fn = newFutureNodeWithResult(futureNodeResult{
+				snPath: snPath,
+				target: target,
+				node:   node,
+			})
+			return fn, false, nil
+		}
+
 		snItem := snPath + "/"
 		oldSubtree, err := arch.loadSubtree(ctx, previous)
 		if err != nil {
@@ -827,6 +860,35 @@ func resolveRelativeTargets(filesys fs.FS, targets []string) ([]backupTarget, er
 }
 
 // SnapshotOptions collect attributes for a new snapshot.
+// SparsePlan tells the archiver which directories a sparse walk must
+// list. It is keyed by absolute target path (the recorded path, not a
+// filesystem-internal one). A directory absent from ListDirs whose
+// parent node carries a subtree is spliced from the parent tree
+// without being opened; the set must therefore be closed under
+// ancestors of every changed inode. The target roots are always
+// listed.
+//
+// Splicing is scoped to Roots, the analysed target paths: only
+// directories at or below a root may be spliced. A target that could
+// not be analysed (for example one not on btrfs, read live) is absent
+// from Roots, so its directories are always listed; splicing them
+// would silently freeze them at the parent state.
+type SparsePlan struct {
+	Roots    []string
+	ListDirs map[string]bool
+}
+
+// Covers reports whether path is at or below one of the plan's
+// analysed roots.
+func (p *SparsePlan) Covers(path string) bool {
+	for _, r := range p.Roots {
+		if path == r || strings.HasPrefix(path, r+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
 type SnapshotOptions struct {
 	Tags           data.TagList
 	Hostname       string
@@ -837,6 +899,11 @@ type SnapshotOptions struct {
 	ProgramVersion string
 	// SkipIfUnchanged omits the snapshot creation if it is identical to the parent snapshot.
 	SkipIfUnchanged bool
+
+	// SparsePlan, when non-nil, enables the btrfs sparse walk.
+	SparsePlan *SparsePlan
+	// BtrfsRecords are attached to the saved snapshot document.
+	BtrfsRecords []data.BtrfsProvenance
 }
 
 // loadParentTree loads a tree referenced by snapshot id. If id is null, nil is returned.
@@ -884,6 +951,7 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 	arch.summary = &Summary{
 		BackupStart: opts.BackupStart,
 	}
+	arch.sparsePlan = opts.SparsePlan
 
 	cleanTargets, err := resolveRelativeTargets(arch.FS, targets)
 	if err != nil {
@@ -958,6 +1026,7 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 
 	sn.ProgramVersion = opts.ProgramVersion
 	sn.Excludes = opts.Excludes
+	sn.Btrfs = opts.BtrfsRecords
 	if opts.ParentSnapshot != nil {
 		sn.Parent = opts.ParentSnapshot.ID()
 	}
