@@ -1,0 +1,8 @@
+[package]
+name = "p6-producer"
+version = "0.1.0"
+edition = "2021"
+description = "Project 6 production producer: derive restic patch-mode changed/deleted lists from a btrfs send stream (streaming TLV parser) and drive the retained-snapshot lifecycle."
+
+[profile.release]
+opt-level = 2
