@@ -289,8 +289,18 @@ def op_symlink_retarget(root, rng, inv, log):
 
 def _other_mode(rng, full):
     cur = os.lstat(full).st_mode & 0o777
-    choices = [m for m in (0o600, 0o644, 0o755, 0o444, 0o640)
-               if m != cur]
+    if os.path.isdir(full):
+        # Directory modes in the differential must keep owner
+        # read+execute: a non-traversable directory (0444, 0600)
+        # blinds the userspace ground-truth walker (EACCES on child
+        # stat), while the kernel send stream is unaffected, which
+        # fabricates divergences. restic in production runs as root
+        # and archives such directories fine; the producer mechanism
+        # is mode-agnostic, so this scoping costs the gate nothing.
+        pool = (0o700, 0o755, 0o500, 0o751)
+    else:
+        pool = (0o600, 0o644, 0o755, 0o444, 0o640)
+    choices = [m for m in pool if m != cur]
     return rng.choice(choices)
 
 

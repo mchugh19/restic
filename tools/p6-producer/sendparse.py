@@ -36,7 +36,13 @@ Semantics that fall out of the format and drive the parser:
     (arbitrary string, not a tree path at all).
   * Content changes appear as update_extent (stream v2) / write /
     clone / truncate / fallocate commands, never as data in
-    --no-data mode.
+    --no-data mode. clone's tail is
+    "offset=.. len=.. from=<source path> clone_offset=..".
+  * set_xattr embeds the raw value bytes: a value containing a
+    newline byte splits the rendered command across physical lines.
+    The parser reassembles logical lines (a physical line not
+    starting with a known command word continues the previous one)
+    and validates the value's byte length against the len= field.
 
 Because stream-time names shift as renames execute, the parser keeps
 the operations in stream order and resolves every name through the
@@ -93,7 +99,11 @@ _ARG_TAIL = {
     "truncate": re.compile(r"\s+size=\S+$"),
     "remove_xattr": re.compile(r"\s+name=\S+$"),
     "fallocate": re.compile(r"\s+offset=\S+\s+len=\S+$"),
-    "clone": re.compile(r"\s+offset=\S+\s+len=\S+(\s+src=\S+)?$"),
+    # clone (stream v2): offset/len on the destination, then
+    # from=<source path> clone_offset=<n>; the source path may
+    # contain escaped spaces, hence the greedy match.
+    "clone": re.compile(
+        r"\s+offset=\S+\s+len=\S+\s+from=.*\s+clone_offset=\S+$"),
 }
 
 
@@ -221,7 +231,7 @@ class DumpParser:
     def _extract_path(self, cmd, rest):
         if cmd == "set_xattr":
             m = re.match(r"^(.*)\s+name=(\S+)\s+data=(.*)\s+len=(\d+)$",
-                         rest)
+                         rest, re.DOTALL)
             if m and len(m.group(3).encode(
                     "utf-8", "surrogateescape")) == int(m.group(4)):
                 return m.group(1)
@@ -239,9 +249,30 @@ class DumpParser:
         return rest
 
     # -- parse into ordered ops ---------------------------------------
+    def _logical_lines(self, dump_text):
+        """Reassemble physical lines into command lines. The dump
+        embeds raw xattr values, which may contain newline bytes and
+        so spill a set_xattr command across physical lines. A
+        physical line that does not begin with a known command word
+        (or the At subvol / snapshot headers) is a continuation of
+        the previous line. Split strictly on \\n: splitlines() would
+        also break on other unicode line boundaries that arbitrary
+        bytes can decode to."""
+        logical = []
+        for phys in dump_text.split("\n"):
+            first = phys.split(None, 1)[0] if phys.strip() else ""
+            if first in KNOWN_CMDS or phys.startswith("At subvol"):
+                logical.append(phys)
+            elif logical:
+                logical[-1] += "\n" + phys
+            elif phys.strip():
+                self.events.append({"kind": "orphan-continuation",
+                                    "line": phys})
+        return logical
+
     def parse(self, dump_text):
         seq = 0
-        for line in dump_text.splitlines():
+        for line in self._logical_lines(dump_text):
             line = line.rstrip()
             if not line or line.startswith("At subvol"):
                 continue
