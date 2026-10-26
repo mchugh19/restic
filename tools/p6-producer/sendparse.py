@@ -41,8 +41,11 @@ Semantics that fall out of the format and drive the parser:
   * set_xattr embeds the raw value bytes: a value containing a
     newline byte splits the rendered command across physical lines.
     The parser reassembles logical lines (a physical line not
-    starting with a known command word continues the previous one)
-    and validates the value's byte length against the len= field.
+    starting with a known command word continues the previous one).
+    The rendered value is lossy: receive --dump prints it with
+    C-string semantics and truncates at the first NUL byte, so the
+    parser extracts only the path and never validates the value
+    (the len= field still reports the true length).
 
 Because stream-time names shift as renames execute, the parser keeps
 the operations in stream order and resolves every name through the
@@ -230,11 +233,16 @@ class DumpParser:
 
     def _extract_path(self, cmd, rest):
         if cmd == "set_xattr":
-            m = re.match(r"^(.*)\s+name=(\S+)\s+data=(.*)\s+len=(\d+)$",
-                         rest, re.DOTALL)
-            if m and len(m.group(3).encode(
-                    "utf-8", "surrogateescape")) == int(m.group(4)):
-                return m.group(1)
+            # The path is everything before the first " name=" (an
+            # escaped path cannot contain that literal: its spaces
+            # are backslash-escaped). The value is NOT recoverable
+            # from the dump: receive --dump renders it with C-string
+            # semantics and truncates at the first NUL byte (observed:
+            # an 8-byte random value starting '7', NUL rendered as
+            # "data=7 len=8"). The producer consumes paths only, so
+            # no value validation is attempted.
+            if " name=" in rest:
+                return rest.split(" name=", 1)[0]
             self.events.append({"kind": "setxattr-unparsed",
                                 "line": rest})
             return rest
