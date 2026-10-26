@@ -155,7 +155,13 @@ def main():
     work = os.path.join(args.base, "work")
     if args.setup:
         os.makedirs(args.base, exist_ok=True)
+        if os.path.exists(root):
+            delete_subvol(root)
         sh("sudo", "btrfs", "subvolume", "create", root)
+        # The subvolume is created by root; hand the top directory to
+        # the invoking user so the copy and later mutations run
+        # unprivileged.
+        sh("sudo", "chown", "%d:%d" % (os.getuid(), os.getgid()), root)
         sh("cp", "-a", "--reflink=always",
            args.corpus + "/.", root + "/")
         snapshot(root, retained)
