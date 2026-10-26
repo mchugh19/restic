@@ -332,7 +332,19 @@ class DumpParser:
 
     # -- resolution ----------------------------------------------------
     def _resolve(self):
-        changed = set()
+        # changed_inode: paths whose INODE changed (content, metadata,
+        # link count). changed_positional: paths that only moved
+        # (directory-move subtree members). The distinction matters
+        # for hardlink sibling expansion below: an inode change
+        # applies to every name of the inode, but a positional change
+        # of one name (its parent directory moved) says nothing about
+        # the inode's other names elsewhere in the tree. Conflating
+        # the two dragged unchanged outside-siblings of moved files
+        # into the changed set (traced in random batch 1: dir g087
+        # renamed; the .hl name of inode 731 inside it pulled its
+        # untouched g069 name in via sibling expansion).
+        changed_inode = set()
+        changed_positional = set()
         deleted = set()
         moves = []  # (old_identity, final_identity) directory moves
 
@@ -340,7 +352,7 @@ class DumpParser:
             if kind in ("create", "modify"):
                 f = self._final_name(path, seq)
                 if f in self.new:
-                    changed.add(f)
+                    changed_inode.add(f)
                 elif not _is_temp(f) and not _is_temp(path):
                     self.events.append({"kind": "op-path-unresolved",
                                         "op": kind, "path": path,
@@ -348,7 +360,7 @@ class DumpParser:
             elif kind == "link":
                 f = self._final_name(path, seq)
                 if f in self.new:
-                    changed.add(f)
+                    changed_inode.add(f)
                 elif not _is_temp(f):
                     self.events.append({"kind": "op-path-unresolved",
                                         "op": kind, "path": path,
@@ -358,6 +370,13 @@ class DumpParser:
                 f = self._final_name(path, seq)
                 if o in self.old and f not in self.new:
                     deleted.add(o)
+                # Removing one name of a multiply-linked inode
+                # changes the inode (nlink, ctime): its surviving
+                # fresh names are inode-changed even though the
+                # stream names only the removed one.
+                if o in self.old and self.old[o]["type"] == "file":
+                    changed_inode.update(
+                        self.new_ino.get(self.old[o]["ino"], []))
             elif kind == "rename":
                 o = self._retained_name(path, seq)
                 f = self._final_name(aux, seq)
@@ -366,11 +385,20 @@ class DumpParser:
                         deleted.add(o)
                     elif f != o:
                         deleted.add(o)
-                        changed.add(f)
+                        changed_positional.add(f)
                         if self.old[o]["type"] == "dir":
                             moves.append((o, f))
 
-        # Subtree effects of directory moves and deletions.
+        # Hardlink sibling expansion over inode-changed paths only.
+        expanded = set()
+        for p in changed_inode:
+            expanded.add(p)
+            if self.new[p]["type"] == "file":
+                expanded.update(self.new_ino.get(self.new[p]["ino"], []))
+        changed_inode = {p for p in expanded if p in self.new}
+
+        # Subtree effects of directory moves and deletions
+        # (positional only: no sibling expansion from here).
         old_children = {}
         for p in self.old:
             old_children.setdefault(p.rpartition("/")[0], []).append(p)
@@ -386,29 +414,21 @@ class DumpParser:
                         stack.append(c)
             return out
 
+        changed = changed_inode | changed_positional
         for (o, f) in moves:
             for c in subtree_old(o):
                 if c not in self.new and c not in changed:
                     deleted.add(c)
                 mapped = f + c[len(o):]
                 if mapped in self.new:
-                    changed.add(mapped)
+                    changed_positional.add(mapped)
         for d in list(deleted):
             if d in self.old and self.old[d]["type"] == "dir":
                 for c in subtree_old(d):
                     if c not in self.new and c not in changed:
                         deleted.add(c)
 
-        # Hardlink sibling expansion: an operation on one name of a
-        # multiply-linked inode applies to all its fresh names; an op
-        # path that names a retained location resolves through the
-        # inode to its fresh names.
-        expanded = set()
-        for p in changed:
-            expanded.add(p)
-            if self.new[p]["type"] == "file":
-                expanded.update(self.new_ino.get(self.new[p]["ino"], []))
-        changed = {p for p in expanded if p in self.new}
+        changed = changed_inode | changed_positional
         deleted = {p for p in deleted
                    if p in self.old and p not in self.new
                    and p not in changed}
