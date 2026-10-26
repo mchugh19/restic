@@ -3,27 +3,33 @@
 `btrfs send --no-data` stream between two read-only snapshots, parsed
 from the text rendering produced by `btrfs receive --dump`.
 
-Empirical basis (btrfs-progs 6.6.3, OCI testbed, 2026-10-26): the
-dump renders one command per line, paths prefixed with ./<snapname>/,
-e.g.:
+Empirical basis (btrfs-progs 6.6.3, OCI testbed, 2026-10-26). The
+dump renders one command per line, paths prefixed ./<snapname>/ and
+padded to a fixed column width, special characters backslash-escaped
+(a space in a name renders as "\\ "), e.g.:
 
     snapshot        ./snap1   uuid=... transid=... parent_uuid=...
     update_extent   ./snap1/dirA/f1.txt   offset=0 len=15
-    utimes          ./snap1/dirA/f1.txt   atime=... mtime=... ctime=...
     link            ./snap1/dirA/f2renamed.txt   dest=f2.txt
     unlink          ./snap1/f2.txt
     mkfile          ./snap1/o263-205-0
     rename          ./snap1/o263-205-0   dest=./snap1/newfile.txt
-    symlink         ./snap1/o265-205-0   dest=newfile.txt
-    set_xattr       ./snap1/newfile.txt   name=user.other data=zzz len=3
+    rename          ./snap1/bulk/d03   dest=./fresh/bulk/rd-d03
+    rename          ./snap1/bulk/d22   dest=./snap1/o287-282-0
+    unlink          ./snap1/o287-282-0/f00-echo.bin
+    rmdir           ./snap1/o287-282-0
 
 Semantics that fall out of the format and drive the parser:
 
-  * A rename of a surviving inode is rendered as link + unlink
-    (new name linked to the inode, old name unlinked), NOT as a
-    rename command. The rename command is used for the kernel's
-    staging names (o<ino>-<transid>-0) under which newly created
-    inodes first appear, and possibly for directory moves.
+  * A rename of a surviving file is rendered as link + unlink (new
+    name linked to the inode, old name unlinked), NOT as a rename
+    command. Directory moves ARE rename commands. Newly created
+    inodes first appear under kernel staging names
+    (o<ino>-<transid>-0) and are renamed into place. A deleted
+    directory is first renamed to a staging name, its children are
+    unlinked under the staging prefix, and the staging name is
+    rmdir'd: names in the stream are valid at their point in the
+    stream, not in either snapshot.
   * dest= means three different things: for link, the existing tree
     path the inode is linked from (no ./ prefix); for rename, the
     new tree path (with ./ prefix); for symlink, the link target
@@ -32,34 +38,36 @@ Semantics that fall out of the format and drive the parser:
     clone / truncate / fallocate commands, never as data in
     --no-data mode.
 
+Because stream-time names shift as renames execute, the parser keeps
+the operations in stream order and resolves every name through the
+rename sequence: final_name() applies later renames forward,
+retained_name() applies earlier renames in reverse. On top of that:
+
+  * Operations on a multiply-linked file are expanded to every fresh
+    path of that inode (the kernel names one representative path;
+    the change applies to the inode, hence to all its names).
+  * A moved directory contributes its whole subtree (old paths
+    deleted, corresponding new paths changed); a deleted directory
+    likewise contributes its subtree as deletions.
+  * Final sets are intersected with tree reality: changed only
+    contains fresh paths, deleted only retained-but-not-fresh paths
+    that were not recreated.
+
 List contract produced here (consumed by the Phase B patch mode):
 
   changed: paths present in the fresh tree that must be archived
     fresh (created, content- or metadata-modified, rename/link
     targets). Rename = changed at the new path.
   deleted: paths present in the retained tree and absent from the
-    fresh tree. A path that was unlinked and recreated in the same
-    interval is changed, not deleted (the patch replaces its node).
+    fresh tree. A path unlinked and recreated in the same interval
+    is changed, not deleted (the patch replaces its node).
 
-Resolution rules applied after collecting raw operations:
-
-  * Staging-name aliases are substituted to their final paths.
-  * Operations on a multiply-linked file are expanded to every fresh
-    path of that inode (the kernel names one representative path;
-    the change applies to the inode, hence to all its names).
-  * An operation naming a path that is not in the fresh tree is
-    resolved through the inode number to the inode's fresh paths.
-  * Final sets are intersected with tree reality: changed only
-    contains fresh paths, deleted only retained-but-not-fresh paths
-    that were not recreated.
-
-Known prototype limitation (the reason the brief reserves a TLV
-parser for production): the text format separates a path from its
-key=value arguments by whitespace, so a path containing a substring
-like " mode=" would be ambiguous. Fixture names avoid argument-like
-substrings; names with ordinary spaces and non-ASCII characters are
-handled and tested. Ambiguous dest= splits are validated against the
-two tree walks and reported as events when not uniquely resolvable.
+Known prototype limitations (the reason the brief reserves a TLV
+parser for production): the text format separates fields by
+whitespace and escapes special characters, so a path containing an
+argument-like substring (" mode=", " dest=" as literal text) can be
+ambiguous. dest= splits are validated against the two tree walks and
+ambiguity is reported as an event, never silently resolved.
 """
 
 import os
@@ -67,8 +75,6 @@ import re
 import subprocess
 import sys
 import time
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TEMP_RE = re.compile(r"^o\d+-\d+-\d+$")
 CREATE_CMDS = {"mkfile", "mkdir", "mknod", "mkfifo", "mksock", "symlink"}
@@ -78,9 +84,6 @@ DELETE_CMDS = {"unlink", "rmdir"}
 KNOWN_CMDS = CREATE_CMDS | CONTENT_CMDS | META_CMDS | DELETE_CMDS | {
     "link", "rename", "snapshot", "subvol"}
 
-# Argument tails for commands whose path is followed by key=value
-# arguments (all argument values are whitespace-free in the dump,
-# except set_xattr data, handled separately).
 _ARG_TAIL = {
     "chmod": re.compile(r"\s+mode=\S+$"),
     "chown": re.compile(r"\s+gid=\S+\s+uid=\S+$"),
@@ -98,15 +101,52 @@ def _is_temp(path):
     return bool(TEMP_RE.match(path.rsplit("/", 1)[-1]))
 
 
+def _unescape(s):
+    """Undo the dump's backslash escaping of path bytes."""
+    out = []
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n == " ":
+                out.append(" ")
+                i += 2
+            elif n == "\\":
+                out.append("\\")
+                i += 2
+            elif n == "n":
+                out.append("\n")
+                i += 2
+            elif n == "t":
+                out.append("\t")
+                i += 2
+            elif n == "r":
+                out.append("\r")
+                i += 2
+            elif n == "x" and i + 3 < len(s) + 1 and \
+                    all(ch in "0123456789abcdefABCDEF"
+                        for ch in s[i + 2:i + 4]):
+                out.append(chr(int(s[i + 2:i + 4], 16)))
+                i += 4
+            else:
+                out.append(c)
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 class DumpParser:
     def __init__(self, snap_name, old_records, new_records):
+        self.snap = snap_name
         self.prefix = "./" + snap_name + "/"
         self.old = old_records
         self.new = new_records
-        self.raw_changed = set()
-        self.raw_deleted = set()
-        self.alias = {}          # staging name -> final path
-        self.events = []         # findings worth reporting
+        self.events = []
+        self.ops = []       # (seq, kind, path, aux) in stream order
+        self.renames = []   # (seq, src, dst) stream-time names
         self.new_ino = {}
         for p, r in new_records.items():
             if r["type"] == "file":
@@ -116,33 +156,29 @@ class DumpParser:
             if r["type"] == "file":
                 self.old_ino.setdefault(r["ino"], []).append(p)
 
-    # -- path helpers ------------------------------------------------
+    # -- lexical layer -----------------------------------------------
     def _strip(self, raw):
-        """Strip the ./<snap>/ prefix; the snapshot root becomes ""."""
-        if raw == "./" + self.prefix.strip("./").rstrip("/"):
+        """Remove the ./<snap>/ prefix; the snapshot root becomes ""
+        and already-relative names (link dest form) pass through."""
+        if raw == self.prefix.rstrip("/"):
             return ""
         if raw.startswith(self.prefix):
             return raw[len(self.prefix):]
-        if raw.endswith("/") and raw[:-1].endswith(self.prefix.rstrip("/")):
+        if raw == "./" + self.snap:
             return ""
-        return raw  # already tree-relative (link dest form)
+        return raw
+
+    def _name(self, raw):
+        return _unescape(self._strip(raw.strip()))
 
     def _split_dest(self, rest, cmd):
-        """Split '<path> dest=<value>' trying every ' dest=' split.
-
-        Returns (path, value) with the split validated per command:
-        link: value must be a retained/fresh/staging path;
-        rename: value (stripped) must be a fresh or staging path;
-        symlink: value is a target string, unvalidated, so the first
-        split after a staging-name path wins, else the last split.
-        """
         splits = []
         start = 0
         while True:
             i = rest.find(" dest=", start)
             if i < 0:
                 break
-            splits.append((rest[:i], rest[i + 6:]))
+            splits.append((rest[:i].rstrip(), rest[i + 6:]))
             start = i + 1
         if not splits:
             self.events.append({"kind": "dest-missing", "cmd": cmd,
@@ -150,46 +186,47 @@ class DumpParser:
             return rest, ""
         valid = []
         for path, value in splits:
-            sp = self._strip(path)
+            sp = self._name(path)
             if cmd == "link":
-                sv = self._strip(value)
+                sv = self._name(value)
                 if sv in self.old or sv in self.new or _is_temp(sv):
                     valid.append((sp, sv))
             elif cmd == "rename":
-                sv = self._strip(value)
-                if sv in self.new or _is_temp(sv) or sv in self.alias:
+                sv = self._name(value)
+                if sv in self.new or _is_temp(sv):
                     valid.append((sp, sv))
             elif cmd == "symlink":
                 if _is_temp(sp):
-                    valid.append((sp, value))
+                    valid.append((sp, _unescape(value)))
         if len(valid) == 1:
             return valid[0]
         if cmd == "symlink" and splits:
-            # Symlink on a real path: the target is the remainder
-            # after the last plausible split; prefer the longest path
-            # that exists in the fresh tree.
             for path, value in reversed(splits):
-                sp = self._strip(path)
+                sp = self._name(path)
                 if sp in self.new:
-                    return sp, value
+                    return sp, _unescape(value)
             p, v = splits[-1]
-            return self._strip(p), v
+            return self._name(p), _unescape(v)
         if valid:
             self.events.append({"kind": "dest-ambiguous", "cmd": cmd,
-                                "line": rest, "candidates": valid})
+                                "line": rest,
+                                "candidates": [list(v) for v in valid]})
             return valid[0]
         p, v = splits[0]
         self.events.append({"kind": "dest-unvalidated", "cmd": cmd,
                             "line": rest})
-        return self._strip(p), self._strip(v) if cmd != "symlink" else v
+        return self._name(p), self._name(v) if cmd != "symlink" else \
+            _unescape(v)
 
     def _extract_path(self, cmd, rest):
         if cmd == "set_xattr":
             m = re.match(r"^(.*)\s+name=(\S+)\s+data=(.*)\s+len=(\d+)$",
                          rest)
-            if m and len(m.group(3)) == int(m.group(4)):
+            if m and len(m.group(3).encode(
+                    "utf-8", "surrogateescape")) == int(m.group(4)):
                 return m.group(1)
-            self.events.append({"kind": "setxattr-unparsed", "line": rest})
+            self.events.append({"kind": "setxattr-unparsed",
+                                "line": rest})
             return rest
         tail = _ARG_TAIL.get(cmd)
         if tail is not None:
@@ -201,8 +238,9 @@ class DumpParser:
             return rest
         return rest
 
-    # -- main entry --------------------------------------------------
+    # -- parse into ordered ops ---------------------------------------
     def parse(self, dump_text):
+        seq = 0
         for line in dump_text.splitlines():
             line = line.rstrip()
             if not line or line.startswith("At subvol"):
@@ -216,69 +254,133 @@ class DumpParser:
                 self.events.append({"kind": "unknown-command",
                                     "cmd": cmd, "line": line})
                 continue
-            if cmd in ("link", "rename", "symlink"):
-                path, value = self._split_dest(rest, cmd)
-                if cmd == "link":
-                    self.raw_changed.add(path)
-                elif cmd == "rename":
-                    self.raw_deleted.add(path)
-                    self.raw_changed.add(value)
-                    if _is_temp(path):
-                        self.alias[path] = value
-                elif cmd == "symlink":
-                    self.raw_changed.add(path)
-                continue
-            path = self._strip(self._extract_path(cmd, rest))
-            if cmd in DELETE_CMDS:
-                self.raw_deleted.add(path)
+            seq += 1
+            if cmd == "rename":
+                src, dst = self._split_dest(rest, cmd)
+                self.ops.append((seq, "rename", src, dst))
+                self.renames.append((seq, src, dst))
+            elif cmd == "link":
+                path, src = self._split_dest(rest, cmd)
+                self.ops.append((seq, "link", path, src))
+            elif cmd == "symlink":
+                path, _target = self._split_dest(rest, cmd)
+                self.ops.append((seq, "create", path, None))
+            elif cmd in DELETE_CMDS:
+                self.ops.append((seq, "delete",
+                                 self._name(rest), None))
+            elif cmd in CREATE_CMDS:
+                self.ops.append((seq, "create",
+                                 self._name(self._extract_path(cmd, rest)),
+                                 None))
             else:
-                self.raw_changed.add(path)
+                self.ops.append((seq, "modify",
+                                 self._name(self._extract_path(cmd, rest)),
+                                 None))
         return self._resolve()
 
+    # -- name resolution through the rename sequence ------------------
+    def _final_name(self, p, seq):
+        for (s, src, dst) in self.renames:
+            if s <= seq:
+                continue
+            if p == src:
+                p = dst
+            elif src and p.startswith(src + "/"):
+                p = dst + p[len(src):]
+        return p
+
+    def _retained_name(self, p, seq):
+        for (s, src, dst) in reversed(self.renames):
+            if s >= seq:
+                continue
+            if p == dst:
+                p = src
+            elif dst and p.startswith(dst + "/"):
+                p = src + p[len(dst):]
+        return p
+
+    # -- resolution ----------------------------------------------------
     def _resolve(self):
-        def subst(p):
-            seen = set()
-            while p in self.alias and p not in seen:
-                seen.add(p)
-                p = self.alias[p]
-            return p
-
         changed = set()
-        for p in self.raw_changed:
-            changed.add(subst(p))
-        deleted_cand = set()
-        for p in self.raw_deleted:
-            deleted_cand.add(subst(p))
+        deleted = set()
+        moves = []  # (old_identity, final_identity) directory moves
 
-        # Expand inode-level operations to all fresh paths of the
-        # inode, resolving op paths that name a retained location of
-        # a surviving inode.
+        for (seq, kind, path, aux) in self.ops:
+            if kind in ("create", "modify"):
+                f = self._final_name(path, seq)
+                if f in self.new:
+                    changed.add(f)
+                elif not _is_temp(f) and not _is_temp(path):
+                    self.events.append({"kind": "op-path-unresolved",
+                                        "op": kind, "path": path,
+                                        "final": f})
+            elif kind == "link":
+                f = self._final_name(path, seq)
+                if f in self.new:
+                    changed.add(f)
+                elif not _is_temp(f):
+                    self.events.append({"kind": "op-path-unresolved",
+                                        "op": kind, "path": path,
+                                        "final": f})
+            elif kind == "delete":
+                o = self._retained_name(path, seq)
+                f = self._final_name(path, seq)
+                if o in self.old and f not in self.new:
+                    deleted.add(o)
+            elif kind == "rename":
+                o = self._retained_name(path, seq)
+                f = self._final_name(aux, seq)
+                if o in self.old:
+                    if f not in self.new:
+                        deleted.add(o)
+                    elif f != o:
+                        deleted.add(o)
+                        changed.add(f)
+                        if self.old[o]["type"] == "dir":
+                            moves.append((o, f))
+
+        # Subtree effects of directory moves and deletions.
+        old_children = {}
+        for p in self.old:
+            old_children.setdefault(p.rpartition("/")[0], []).append(p)
+
+        def subtree_old(dirpath):
+            out = []
+            stack = [dirpath]
+            while stack:
+                d = stack.pop()
+                for c in old_children.get(d, []):
+                    out.append(c)
+                    if self.old[c]["type"] == "dir":
+                        stack.append(c)
+            return out
+
+        for (o, f) in moves:
+            for c in subtree_old(o):
+                if c not in self.new and c not in changed:
+                    deleted.add(c)
+                mapped = f + c[len(o):]
+                if mapped in self.new:
+                    changed.add(mapped)
+        for d in list(deleted):
+            if d in self.old and self.old[d]["type"] == "dir":
+                for c in subtree_old(d):
+                    if c not in self.new and c not in changed:
+                        deleted.add(c)
+
+        # Hardlink sibling expansion: an operation on one name of a
+        # multiply-linked inode applies to all its fresh names; an op
+        # path that names a retained location resolves through the
+        # inode to its fresh names.
         expanded = set()
         for p in changed:
-            if p in self.new:
-                expanded.add(p)
-                ino = self.new[p].get("ino")
-                if self.new[p]["type"] == "file":
-                    expanded.update(self.new_ino.get(ino, []))
-            elif p in self.old:
-                ino = self.old[p].get("ino")
-                sibs = self.new_ino.get(ino, [])
-                if sibs:
-                    expanded.update(sibs)
-                else:
-                    self.events.append({"kind": "op-path-vanished",
-                                        "path": p})
-            elif not _is_temp(p):
-                self.events.append({"kind": "op-path-unresolved",
-                                    "path": p})
+            expanded.add(p)
+            if self.new[p]["type"] == "file":
+                expanded.update(self.new_ino.get(self.new[p]["ino"], []))
         changed = {p for p in expanded if p in self.new}
-
-        deleted = set()
-        for p in deleted_cand:
-            if _is_temp(p):
-                continue
-            if p in self.old and p not in self.new and p not in changed:
-                deleted.add(p)
+        deleted = {p for p in deleted
+                   if p in self.old and p not in self.new
+                   and p not in changed}
         return changed, deleted, self.events
 
 
@@ -323,11 +425,14 @@ def produce(root, retained, fresh, workdir):
                        check=True, stdout=f,
                        stderr=subprocess.PIPE)
     t2 = time.time()
-    with open(dump, "w") as f:
+    with open(dump, "wb") as f:
         subprocess.run(["btrfs", "receive", "--dump", "-f", stream],
                        check=True, stdout=f, stderr=subprocess.PIPE)
     t3 = time.time()
-    with open(dump) as f:
+    # The dump embeds raw filename and xattr-value bytes; decode with
+    # surrogateescape so byte-exact names round-trip, matching how
+    # os.scandir surfaces them on the ground-truth side.
+    with open(dump, encoding="utf-8", errors="surrogateescape") as f:
         text = f.read()
     return text, {"snapshot_s": t1 - t0, "send_s": t2 - t1,
                   "dump_s": t3 - t2, "stream_bytes": os.path.getsize(stream)}

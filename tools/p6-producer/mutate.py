@@ -287,9 +287,16 @@ def op_symlink_retarget(root, rng, inv, log):
     log.append(("symlink_retarget", rel))
 
 
+def _other_mode(rng, full):
+    cur = os.lstat(full).st_mode & 0o777
+    choices = [m for m in (0o600, 0o644, 0o755, 0o444, 0o640)
+               if m != cur]
+    return rng.choice(choices)
+
+
 def op_chmod_only(root, rng, inv, log):
     rel = rng.choice(inv["files"] + inv["dirs"])
-    os.chmod(_p(root, rel), rng.choice([0o600, 0o644, 0o755, 0o444]))
+    os.chmod(_p(root, rel), _other_mode(rng, _p(root, rel)))
     log.append(("chmod_only", rel))
 
 
@@ -370,12 +377,25 @@ def op_modify_hardlinked(root, rng, inv, log):
 
 
 def op_metadata_storm(root, rng, inv, log):
-    cands = [d for d in inv["dirs"] if d]
+    # Pick a directory that actually contains files (a storm over an
+    # empty directory tests nothing).
+    cands = []
+    for d in inv["dirs"]:
+        if not d:
+            continue
+        n = sum(len(fn) for _dp, _dn, fn in os.walk(_p(root, d)))
+        if n >= 3:
+            cands.append(d)
+    if not cands:
+        log.append(("metadata_storm", "skipped:no-populated-dir"))
+        return
     rel = rng.choice(cands)
     for dirpath, _dn, fn in os.walk(_p(root, rel)):
         for name in fn:
-            os.chmod(os.path.join(dirpath, name),
-                     rng.choice([0o600, 0o640, 0o644]))
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                continue
+            os.chmod(full, _other_mode(rng, full))
     log.append(("metadata_storm", rel))
 
 

@@ -19,8 +19,11 @@ Comparison definition (per relative path, "" denotes the tree root):
 
   changed(path): the path exists in both trees and any compared field
     differs: type, file size, mtime_ns, mode, uid, gid, symlink
-    target, xattr dict, or content hash. A type difference counts as
-    changed (replace semantics), not as delete+create.
+    target, xattr dict, content hash, or hardlink count (nlink is
+    archived by restic, so a link added or removed elsewhere makes
+    every surviving name of the inode changed for patch purposes).
+    A type difference counts as changed (replace semantics), not as
+    delete+create.
   created(path): exists only in the new tree. Reported as part of
     the changed set (patch mode archives it fresh).
   deleted(path): exists only in the old tree.
@@ -139,7 +142,7 @@ def walk(root, hash_content=True):
 
 
 _COMPARE_KEYS = ("type", "mode", "uid", "gid", "mtime_ns",
-                 "size", "target", "xattrs", "sha256")
+                 "size", "target", "xattrs", "sha256", "nlink")
 
 
 def diff(old, new):

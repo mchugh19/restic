@@ -108,6 +108,10 @@ def cycle(case_dir, root, retained, fresh, label, apply_fn, rng):
     apply_fn(oplog)
     t0 = time.time()
     dump_text, timings = sendparse.produce(root, retained, fresh, work)
+    safe = label.replace(":", "_").replace("/", "_")
+    with open(os.path.join(work, safe + ".dump"), "w",
+              encoding="utf-8", errors="surrogateescape") as f:
+        f.write(dump_text)
     new = treediff.walk(fresh, hash_content=True)
     gt_c, gt_d, _detail = treediff.diff(old, new)
     p_c, p_d, events = sendparse.parse_dump(
