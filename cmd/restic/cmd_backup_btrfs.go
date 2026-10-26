@@ -40,6 +40,18 @@ func btrfsConfigHash(target string, opts BackupOptions) string {
 // full walk; the reason is reported through logf. Falling back is
 // always safe, so this function never fails the backup.
 func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string, opts BackupOptions, logf func(string, ...interface{})) ([]data.BtrfsProvenance, *archiver.SparsePlan) {
+	return prepareBtrfsPlan(bfs.InfoFor, bfs.ResolvedTarget, bfs.Lstat, parent, targets, opts, logf)
+}
+
+// prepareBtrfsPlan is prepareBtrfsRun against the three snapshot
+// wrapper operations it needs, taken as functions so tests can
+// substitute fakes for the wrapper.
+func prepareBtrfsPlan(
+	infoFor func(string) (fs.BtrfsSnapInfo, bool),
+	resolvedTarget func(string) string,
+	lstat func(string) (*fs.ExtendedFileInfo, error),
+	parent *data.Snapshot, targets []string, opts BackupOptions, logf func(string, ...interface{}),
+) ([]data.BtrfsProvenance, *archiver.SparsePlan) {
 	records := make([]data.BtrfsProvenance, 0, len(targets))
 	sparseOK := feature.Flag.Enabled(feature.BtrfsSparseScan) && parent != nil
 	if opts.WithAtime {
@@ -50,7 +62,7 @@ func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string
 	var analysedRoots []string
 
 	for _, target := range targets {
-		info, ok := bfs.InfoFor(target)
+		info, ok := infoFor(target)
 		if !ok {
 			// Not on btrfs (read live): no record, no plan entries,
 			// and crucially no veto over the other targets. The
@@ -68,7 +80,6 @@ func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string
 		if err != nil {
 			key = filepath.Clean(target)
 		}
-		analysedRoots = append(analysedRoots, key)
 		hash := btrfsConfigHash(key, opts)
 		records = append(records, data.BtrfsProvenance{
 			Path:       key,
@@ -77,6 +88,18 @@ func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string
 			Complete:   true,
 			ConfigHash: hash,
 		})
+		// Only directory targets seed a sparse analysis. A file
+		// target is handled identically in both modes (one stat,
+		// one read), so analysing its whole subvolume for it can
+		// only lose time; leaving it out of the plan's scope makes
+		// the archiver treat it exactly as a full walk does, and
+		// it neither triggers nor vetoes an analysis. Dir-ness is
+		// judged through the snapshot, the tree the archiver reads.
+		fi, err := lstat(key)
+		if err != nil || !fi.Mode.IsDir() {
+			continue
+		}
+		analysedRoots = append(analysedRoots, key)
 		if !sparseOK {
 			continue
 		}
@@ -99,7 +122,7 @@ func prepareBtrfsRun(bfs *fs.LocalBtrfs, parent *data.Snapshot, targets []string
 			fail = "snapshot generation did not advance"
 		case prec.ConfigHash != hash:
 			fail = "backup configuration changed since the parent snapshot"
-		case !addSparseDirs(info, prec.Generation, key, bfs.ResolvedTarget(target), listDirs, logf):
+		case !addSparseDirs(info, prec.Generation, key, resolvedTarget(target), listDirs, logf):
 			fail = "" // addSparseDirs already logged the reason
 			sparseOK = false
 		}
