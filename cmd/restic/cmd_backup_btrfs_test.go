@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/restic/restic/internal/archiver"
+	"github.com/restic/restic/internal/btrfs"
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/fs"
@@ -113,5 +115,79 @@ func TestPrepareBtrfsPlanMixedTargetsAnalyseDirsOnly(t *testing.T) {
 	}
 	if n := logs.count("opening snapshot"); n != 1 {
 		t.Fatalf("expected exactly one analysis attempt (the directory target), got %d: %v", n, logs.lines)
+	}
+}
+
+// Past the analysis budget the changed-set resolution stops
+// immediately, reports the budget line, and reports failure so the
+// caller falls back to a full walk.
+func TestSparseListDirsBudgetAborts(t *testing.T) {
+	defer func(prev int) { sparseAnalysisBudget = prev }(sparseAnalysisBudget)
+	sparseAnalysisBudget = 3
+
+	items := map[uint64]*btrfs.InodeInfo{}
+	for i := uint64(1); i <= 10; i++ {
+		items[1000+i] = &btrfs.InodeInfo{TransID: 50, Mode: 0o100644}
+	}
+	resolved := 0
+	resolve := func(uint64) ([]string, error) {
+		resolved++
+		return []string{"sub/file"}, nil
+	}
+	logs := &btrfsLogCapture{}
+	listDirs := map[string]bool{}
+	ok := sparseListDirs(items, 10, "/vol", "/vol",
+		func(p string) string { return p }, resolve, listDirs, logs.logf)
+
+	if ok {
+		t.Fatal("expected the analysis to abort past the budget")
+	}
+	if resolved != 3 {
+		t.Fatalf("expected resolution to stop at the budget (3), got %d resolutions", resolved)
+	}
+	want := "btrfs sparse scan: analysis budget exceeded (4 changed inodes), running full walk"
+	if len(logs.lines) != 1 || logs.lines[0] != want {
+		t.Fatalf("expected the single log line %q, got %v", want, logs.lines)
+	}
+}
+
+// Within the budget the changed directories and the ancestors of
+// changed inodes are listed, unchanged inodes are never resolved,
+// and leaf-stamp-only changes (D2) count as changed.
+func TestSparseListDirsWithinBudget(t *testing.T) {
+	const (
+		dirIno  = 2001 // changed directory (D1)
+		fileIno = 2002 // changed by leaf stamp only (D2)
+		oldIno  = 2003 // unchanged
+	)
+	items := map[uint64]*btrfs.InodeInfo{
+		dirIno:  {TransID: 50, LeafStamp: 50, Mode: 0o40755},
+		fileIno: {TransID: 5, LeafStamp: 60, Mode: 0o100644},
+		oldIno:  {TransID: 5, LeafStamp: 5, Mode: 0o100644},
+	}
+	paths := map[uint64][]string{
+		dirIno:  {"sub"},
+		fileIno: {"sub/file"},
+		oldIno:  {"sub/old"},
+	}
+	var resolved []uint64
+	resolve := func(ino uint64) ([]string, error) {
+		resolved = append(resolved, ino)
+		return paths[ino], nil
+	}
+	logs := &btrfsLogCapture{}
+	listDirs := map[string]bool{}
+	ok := sparseListDirs(items, 10, "/vol", "/vol",
+		func(p string) string { return p }, resolve, listDirs, logs.logf)
+
+	if !ok {
+		t.Fatalf("expected the analysis to succeed within the budget, logs: %v", logs.lines)
+	}
+	if len(resolved) != 2 {
+		t.Fatalf("expected exactly the two changed inodes to be resolved, got %v", resolved)
+	}
+	want := map[string]bool{"/vol": true, "/vol/sub": true}
+	if !reflect.DeepEqual(listDirs, want) {
+		t.Fatalf("expected listDirs %v, got %v", want, listDirs)
 	}
 }

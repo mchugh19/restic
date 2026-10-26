@@ -190,11 +190,44 @@ func addSparseDirs(info fs.BtrfsSnapInfo, gPrev uint64, spelledAbs, physTarget s
 		return false
 	}
 
+	resolve := func(ino uint64) ([]string, error) {
+		return btrfs.InoPaths(f.Fd(), ino)
+	}
+	return sparseListDirs(items, gPrev, info.SubvolRoot, physTarget, toSpelled, resolve, listDirs, logf)
+}
+
+// sparseAnalysisBudget bounds the changed inodes a single sparse
+// analysis will resolve paths for. The value is a compromise: far
+// above the changed set of a healthy nightly run, far below the
+// point where the analysis costs more than the full walk it
+// replaces. A variable, not a constant, so tests can shrink it.
+var sparseAnalysisBudget = 20000
+
+// sparseListDirs resolves the paths of the inodes changed since
+// gPrev and records in listDirs every directory that must be
+// listed for the walk to reach the changes: each changed
+// directory at or below physTarget, plus every ancestor of a
+// changed inode down to (and including) the target root.
+// Directories outside that set have no changed descendants and
+// are spliced from the parent tree.
+//
+// Resolving a path costs an ioctl per inode, so the work is
+// bounded by sparseAnalysisBudget: an old parent generation or a
+// churny tree can produce a changed set whose resolution costs
+// more than the walk being saved. Past the budget the analysis
+// aborts and the caller falls back to a full walk.
+func sparseListDirs(items map[uint64]*btrfs.InodeInfo, gPrev uint64, subvolRoot, physTarget string, toSpelled func(string) string, resolve func(uint64) ([]string, error), listDirs map[string]bool, logf func(string, ...interface{})) bool {
+	changed := 0
 	for ino, it := range items {
 		if it.TransID <= gPrev && it.LeafStamp <= gPrev {
 			continue
 		}
-		paths, err := btrfs.InoPaths(f.Fd(), ino)
+		changed++
+		if changed > sparseAnalysisBudget {
+			logf("btrfs sparse scan: analysis budget exceeded (%d changed inodes), running full walk", changed)
+			return false
+		}
+		paths, err := resolve(ino)
 		if err != nil {
 			logf("btrfs sparse scan: %v, running full walk", err)
 			return false
@@ -203,7 +236,7 @@ func addSparseDirs(info fs.BtrfsSnapInfo, gPrev uint64, spelledAbs, physTarget s
 			if p == "" || p == ".." {
 				continue // the subvolume root itself
 			}
-			abs := filepath.Join(info.SubvolRoot, filepath.FromSlash(p))
+			abs := filepath.Join(subvolRoot, filepath.FromSlash(p))
 			if abs != physTarget && !strings.HasPrefix(abs, physTarget+string(os.PathSeparator)) {
 				continue // belongs to a different target of this subvolume
 			}
