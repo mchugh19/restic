@@ -93,6 +93,8 @@ type BackupOptions struct {
 	IgnoreInode       bool
 	IgnoreCtime       bool
 	UseFsSnapshot     bool
+	PatchChangedFrom  string
+	PatchDeletedFrom  string
 	DryRun            bool
 	ReadConcurrency   uint
 	NoScan            bool
@@ -141,6 +143,8 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 		f.BoolVar(&opts.ExcludeCloudFiles, "exclude-cloud-files", false, "excludes online-only cloud files (such as OneDrive, iCloud drive, …)")
 	}
 	f.BoolVar(&opts.SkipIfUnchanged, "skip-if-unchanged", false, "skip snapshot creation if identical to parent snapshot")
+	f.StringVar(&opts.PatchChangedFrom, "patch-changed-from", "", "read the paths changed since the parent snapshot from `file` (patch mode, requires the patch-mode feature and --patch-deleted-from)")
+	f.StringVar(&opts.PatchDeletedFrom, "patch-deleted-from", "", "read the paths deleted since the parent snapshot from `file` (patch mode, requires the patch-mode feature and --patch-changed-from)")
 
 	opts.readConcurrencyFlag = f.Lookup("read-concurrency")
 
@@ -676,10 +680,28 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		}
 	}
 
-	// In sparse mode the scanner's full walk would eat the saving, so
-	// it is skipped like with --no-scan; totals then come from the
-	// archiver alone.
-	if !opts.NoScan && sparsePlan == nil {
+	// Patch mode (project 6): the plan comes from the changed and
+	// deleted path lists, independently of any filesystem snapshot;
+	// targetFS is whatever the run reads through (the btrfs snapshot
+	// wrapper when --use-fs-snapshot is in effect, the live tree
+	// otherwise).
+	var patchPlan *archiver.PatchPlan
+	if opts.PatchChangedFrom != "" || opts.PatchDeletedFrom != "" {
+		patchPlan = preparePatchRun(ctx, repo, targetFS, parentSnapshot, targets, opts,
+			func(format string, args ...interface{}) {
+				if !gopts.JSON {
+					printer.P(format, args...)
+				}
+			})
+		if patchPlan != nil && !gopts.JSON {
+			printer.P("patch mode: patching the parent snapshot, only listed directories will be walked\n")
+		}
+	}
+
+	// In sparse and patch mode the scanner's full walk would eat the
+	// saving, so it is skipped like with --no-scan; totals then come
+	// from the archiver alone.
+	if !opts.NoScan && sparsePlan == nil && patchPlan == nil {
 		sc := archiver.NewScanner(targetFS)
 		sc.SelectByName = selectByNameFilter
 		sc.Select = selectFilter
@@ -731,6 +753,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		ProgramVersion:  "restic " + global.Version,
 		SkipIfUnchanged: opts.SkipIfUnchanged,
 		SparsePlan:      sparsePlan,
+		PatchPlan:       patchPlan,
 		BtrfsRecords:    btrfsRecords,
 	}
 
