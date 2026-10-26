@@ -107,6 +107,12 @@ type Archiver struct {
 	// subtree without being opened.
 	sparsePlan *SparsePlan
 
+	// patchPlan, when set by Snapshot(), restricts directory listing
+	// to the directories the changed/deleted path lists require
+	// (feature patch-mode); all other directories reuse their parent
+	// subtree without being opened.
+	patchPlan *PatchPlan
+
 	// Error is called for all errors that occur during backup.
 	Error ErrorFunc
 
@@ -456,6 +462,30 @@ func (arch *Archiver) allBlobsPresent(previous *data.Node) bool {
 	return true
 }
 
+// spliceDir reports whether the directory at abstarget may reuse
+// the parent subtree instead of being listed. At least one walk plan
+// must be active, and every active plan must both cover the path and
+// not list it: a directory is listed if any plan wants it listed.
+func (arch *Archiver) spliceDir(abstarget string, previous *data.Node) bool {
+	if previous == nil || previous.Subtree == nil {
+		return false
+	}
+	active := false
+	if p := arch.sparsePlan; p != nil {
+		active = true
+		if !p.Covers(abstarget) || p.ListDirs[abstarget] {
+			return false
+		}
+	}
+	if p := arch.patchPlan; p != nil {
+		active = true
+		if !p.Covers(abstarget) || p.ListDirs[abstarget] {
+			return false
+		}
+	}
+	return active
+}
+
 // save saves a target (file or directory) to the repo. If the item is
 // excluded, this function returns a nil node and error, with excluded set to
 // true.
@@ -594,14 +624,13 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 	case fi.Mode.IsDir():
 		debug.Log("  %v dir", target)
 
-		// btrfs sparse scan: a directory outside the changed set keeps
-		// its parent subtree verbatim and is never opened. Its inode
-		// item did not change (the fs wrapper already statted it above),
-		// so a node built from the current stat is identical to the one
-		// a full walk would build.
-		if arch.sparsePlan != nil && previous != nil && previous.Subtree != nil &&
-			arch.sparsePlan.Covers(abstarget) &&
-			!arch.sparsePlan.ListDirs[abstarget] {
+		// Plan-driven walks (btrfs sparse scan, patch mode): a
+		// directory no plan lists keeps its parent subtree verbatim
+		// and is never opened. The plans guarantee it has no changed
+		// descendants, and the fs wrapper already statted the
+		// directory itself above, so a node built from the current
+		// stat is identical to the one a full walk would build.
+		if arch.spliceDir(abstarget, previous) {
 			// build the node exactly as saveDir would (it calls
 			// MakeReadable before nodeFromFileInfo)
 			if err := meta.MakeReadable(); err != nil {
@@ -902,6 +931,8 @@ type SnapshotOptions struct {
 
 	// SparsePlan, when non-nil, enables the btrfs sparse walk.
 	SparsePlan *SparsePlan
+	// PatchPlan, when non-nil, enables the patch-mode walk.
+	PatchPlan *PatchPlan
 	// BtrfsRecords are attached to the saved snapshot document.
 	BtrfsRecords []data.BtrfsProvenance
 }
@@ -952,6 +983,7 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 		BackupStart: opts.BackupStart,
 	}
 	arch.sparsePlan = opts.SparsePlan
+	arch.patchPlan = opts.PatchPlan
 
 	cleanTargets, err := resolveRelativeTargets(arch.FS, targets)
 	if err != nil {
