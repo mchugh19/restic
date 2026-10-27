@@ -14,7 +14,8 @@
 //!   p6-producer prepare  <same flags>
 //!       Wrapper hook 1: snapshot + diff + per-target lists + a JSON
 //!       manifest. Exit 0 patch-ready, 2 init needed, 3 fallback
-//!       needed, 1 hard failure.
+//!       needed, 4 root is not on a btrfs filesystem (manifest mode
+//!       "unsupported", no state touched), 1 hard failure.
 //!   p6-producer finalize <same flags> --result success|fallback|init|abort
 //!       Wrapper hook 2: rotate / re-base / establish the retained
 //!       snapshot after the wrapper's backups have run.

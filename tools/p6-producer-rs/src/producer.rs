@@ -41,7 +41,11 @@
 //!             2: initialisation needed (plain backup from fresh,
 //!             then finalize --result init); 3: producer failure
 //!             (plain backup from fresh, then finalize --result
-//!             fallback); 1: hard failure.
+//!             fallback); 4: the root is not on a btrfs filesystem
+//!             (manifest mode "unsupported"; checked by statfs
+//!             before any state is touched, so no snapshot, phase
+//!             write or retained/fresh change happens); 1: hard
+//!             failure.
 //!   finalize  --result success: mark backed-up, then rotate
 //!             (a crash inside finalize therefore leaves a
 //!             backed-up marker the next prepare adopts).
@@ -76,7 +80,26 @@ use crate::parse::{parse_stream, ParseError};
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
     fn getpid() -> i32;
+    fn statfs(path: *const std::ffi::c_char, buf: *mut u8) -> i32;
 }
+
+/// statfs(2) filesystem magic of the filesystem holding `path`
+/// (the f_type word of struct statfs), or None when statfs itself
+/// fails. Only f_type, the struct's first word, is read, so a
+/// zeroed scratch buffer stands in for the full struct.
+fn fs_magic(path: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = [0u8; 128];
+    if unsafe { statfs(c.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&buf[..8]);
+    Some(u64::from_ne_bytes(word))
+}
+
+/// BTRFS_SUPER_MAGIC (statfs f_type for btrfs filesystems).
+const BTRFS_SUPER_MAGIC: u64 = 0x9123683E;
 
 pub struct Args {
     pub root: String,
@@ -780,6 +803,22 @@ impl Producer {
 
     // -- prepare (wrapper hook 1) ---------------------------------------
     pub fn prepare(&mut self) -> i32 {
+        // Filesystem guard, before any state is touched: the
+        // lifecycle needs btrfs snapshots of the root. On any other
+        // filesystem, decline cleanly with the dedicated exit code
+        // 4 and an "unsupported" manifest, so the wrapper falls
+        // back to stock backups without the hard-failure path and
+        // no state changes happen here (no snapshot, no phase
+        // write, no retained/fresh change). A failed statfs falls
+        // through to the normal path, which fails there as before.
+        if let Some(magic) = fs_magic(&self.root) {
+            if magic != BTRFS_SUPER_MAGIC {
+                println!(
+                    "{{\"mode\": \"unsupported\", \"reason\": \"root filesystem is not btrfs\"}}"
+                );
+                return 4;
+            }
+        }
         if let Err(e) = fs::create_dir_all(&self.state) {
             eprintln!("{e}");
             return 1;
