@@ -409,6 +409,121 @@ def op_metadata_storm(root, rng, inv, log):
     log.append(("metadata_storm", rel))
 
 
+OLD_NS = 1_000_000_000_000_000_000  # 2001-09-09; stale under relatime
+
+
+def _subtree_paths(root, rel):
+    """(dirs, files) under rel (rel itself included in dirs),
+    symlinks excluded from files."""
+    dirs, files = [], []
+    for dirpath, _dn, filenames in os.walk(_p(root, rel)):
+        rp = os.path.relpath(dirpath, root)
+        rp = "" if rp == "." else rp
+        dirs.append(rp)
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                continue
+            files.append(name if not rp else rp + "/" + name)
+    return dirs, files
+
+
+def _age_atimes(root, paths):
+    for rp in paths:
+        full = _p(root, rp)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        os.utime(full, ns=(OLD_NS, st.st_mtime_ns))
+
+
+def op_atime_sweep(root, rng, inv, log):
+    # Mass touch -a: every file and directory under one subtree
+    # gets a fresh atime; no mtime moves.
+    cands = [d for d in inv["dirs"] if d]
+    if not cands:
+        return
+    rel = rng.choice(cands)
+    dirs, files = _subtree_paths(root, rel)
+    n = 0
+    for rp in dirs + files:
+        full = _p(root, rp)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        os.utime(full, ns=(st.st_atime_ns + 10**12, st.st_mtime_ns))
+        n += 1
+    log.append(("atime_sweep", f"{rel} ({n} paths)"))
+
+
+def op_readdir_sweep(root, rng, inv, log):
+    # Age every atime in a subtree, then readdir-walk it: under
+    # relatime the directory atimes refresh; nothing else moves.
+    cands = [d for d in inv["dirs"] if d]
+    if not cands:
+        return
+    rel = rng.choice(cands)
+    dirs, files = _subtree_paths(root, rel)
+    _age_atimes(root, dirs + files)
+
+    def walk(d):
+        with os.scandir(d) as it:
+            entries = list(it)
+        for e in entries:
+            if e.is_dir(follow_symlinks=False):
+                walk(e.path)
+    walk(_p(root, rel))
+    log.append(("readdir_sweep", rel))
+
+
+def op_read_sweep(root, rng, inv, log):
+    # Age every file atime in a subtree, then read every file:
+    # under relatime the file atimes refresh; contents untouched.
+    cands = [d for d in inv["dirs"] if d]
+    if not cands:
+        return
+    rel = rng.choice(cands)
+    _dirs, files = _subtree_paths(root, rel)
+    _age_atimes(root, files)
+    n = 0
+    for rp in files:
+        with open(_p(root, rp), "rb") as f:
+            while f.read(1 << 16):
+                pass
+        n += 1
+    log.append(("read_sweep", f"{rel} ({n} files)"))
+
+
+def op_atime_mixed(root, rng, inv, log):
+    # Three neighbours, three fates: content-modified AND atime-
+    # touched (must stay changed), atime-touched only (must drop),
+    # atime and mtime both moved (must stay changed).
+    a, b, c = rng.sample(inv["files"], 3)
+    with open(_p(root, a), "ab") as f:
+        f.write(b"mixed")
+    st = os.lstat(_p(root, a))
+    os.utime(_p(root, a), ns=(st.st_atime_ns + 10**12, st.st_mtime_ns))
+    st = os.lstat(_p(root, b))
+    os.utime(_p(root, b), ns=(st.st_atime_ns + 10**12, st.st_mtime_ns))
+    ns = rng.randrange(10**17, 17 * 10**17)
+    os.utime(_p(root, c), ns=(ns, ns))
+    log.append(("atime_mixed", f"{a}|{b}|{c}"))
+
+
+def op_new_file_utime(root, rng, inv, log):
+    # A genuinely new file that also receives an atime touch
+    # before the snapshot: it must stay in the changed set (the
+    # retained tree holds no path the filter could prove from).
+    rel = _fresh_name(rng, inv)
+    _write(_p(root, rel), _rand_bytes(rng, 64))
+    st = os.lstat(_p(root, rel))
+    os.utime(_p(root, rel),
+             ns=(st.st_atime_ns + 10**12, st.st_mtime_ns))
+    log.append(("new_file_utime", rel))
+
+
 RANDOM_OPS = [
     (op_create_file, 14), (op_create_dir, 4), (op_modify_append, 14),
     (op_modify_rewrite, 8), (op_modify_preserve_mtime, 4),
@@ -421,6 +536,8 @@ RANDOM_OPS = [
     (op_type_file_to_dir, 2), (op_type_file_to_symlink, 2),
     (op_type_dir_to_file, 1), (op_reflink_copy, 3),
     (op_modify_hardlinked, 3), (op_metadata_storm, 1),
+    (op_atime_sweep, 2), (op_readdir_sweep, 2), (op_read_sweep, 2),
+    (op_atime_mixed, 2), (op_new_file_utime, 3),
 ]
 
 
@@ -459,6 +576,11 @@ def matrix_cases():
         "chmod_only": [op_chmod_only] * 4,
         "utimes_only": [op_utimes_only] * 4,
         "atime_only": [op_atime_only] * 4,
+        "atime_sweep": [op_atime_sweep] * 2,
+        "readdir_sweep": [op_readdir_sweep] * 2,
+        "read_sweep": [op_read_sweep] * 2,
+        "atime_mixed": [op_atime_mixed] * 2,
+        "new_file_utime": [op_new_file_utime] * 2,
         "xattr_change": [op_xattr_change] * 5,
         "type_file_to_dir": [op_type_file_to_dir] * 2,
         "type_file_to_symlink": [op_type_file_to_symlink] * 2,
