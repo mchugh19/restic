@@ -41,6 +41,9 @@ impl From<io::Error> for ParseError {
 pub struct ParseOutcome {
     pub changed: HashSet<Vec<u8>>,
     pub deleted: HashSet<Vec<u8>>,
+    /// Changed candidates the resolver proved atime-only and
+    /// dropped (see resolve.rs); not part of either list.
+    pub atime_only: u64,
     pub events: Vec<Event>,
     pub version: u32,
     pub commands: u64,
@@ -56,10 +59,11 @@ pub fn parse_stream<R: Read>(
     let version = reader.version;
     let commands = reader.commands;
     let mut resolver = Resolver::new(retained.to_path_buf(), fresh.to_path_buf())?;
-    let (changed, deleted) = resolver.resolve(&ops)?;
+    let (changed, deleted, atime_only) = resolver.resolve(&ops)?;
     Ok(ParseOutcome {
         changed,
         deleted,
+        atime_only,
         events: resolver.events,
         version,
         commands,

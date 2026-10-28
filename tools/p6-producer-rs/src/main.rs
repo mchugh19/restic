@@ -130,9 +130,10 @@ fn cmd_parse(flags: &HashMap<String, String>) -> i32 {
         .map(|e| format!("{{\"kind\": \"{}\"}}", e.kind))
         .collect();
     println!(
-        "{{\"changed\": {}, \"deleted\": {}, \"version\": {}, \"commands\": {}, \"events\": [{}]}}",
+        "{{\"changed\": {}, \"deleted\": {}, \"atime_only\": {}, \"version\": {}, \"commands\": {}, \"events\": [{}]}}",
         outcome.changed.len(),
         outcome.deleted.len(),
+        outcome.atime_only,
         outcome.version,
         outcome.commands,
         events.join(", ")

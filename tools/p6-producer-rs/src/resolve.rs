@@ -30,6 +30,22 @@
 //!   * Final sets are intersected with tree reality: changed holds
 //!     only fresh paths, deleted only retained paths that are
 //!     absent from the fresh tree and not also changed.
+//!
+//! One deliberate divergence from the reference: the atime-only
+//! filter. A path is atime-only when every stream operation that
+//! implicates it is a set_times record (no create, content,
+//! metadata, link or rename operation) and the mtime carried by
+//! its (last) set_times record equals, to the nanosecond, the
+//! mtime of the same path in the retained snapshot. Atime-only
+//! paths are removed from the changed set and counted separately:
+//! pure access-time updates (a backup's own reads, an integrity
+//! scan walking the tree) are not changes restic needs to hear
+//! about. Every doubt fails toward inclusion: a missing or
+//! undecodable stream mtime, a path absent from the retained
+//! tree, a hardlink sibling reached from a substantive operation,
+//! or any non-utime operation on the path keeps it in the changed
+//! set. A dropped path keeps its parent-tree atime in the next
+//! snapshot; no other tree fact is affected.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -53,6 +69,10 @@ struct Meta {
     typ: Typ,
     ino: u64,
     nlink: u64,
+    /// lstat mtime as (seconds, nanoseconds); the atime filter
+    /// compares the retained tree's value against the mtime a
+    /// set_times record carries.
+    mtime: (i64, i64),
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +181,7 @@ impl Resolver {
             typ,
             ino: md.ino(),
             nlink: md.nlink(),
+            mtime: (md.mtime(), md.mtime_nsec()),
         })
     }
 
@@ -235,6 +256,7 @@ impl Resolver {
                                 typ,
                                 ino: md.ino(),
                                 nlink: md.nlink(),
+                                mtime: (md.mtime(), md.mtime_nsec()),
                             }),
                         );
                         ft.is_dir() && md.ino() != 256
@@ -253,7 +275,7 @@ impl Resolver {
     pub fn resolve(
         &mut self,
         ops: &[Op],
-    ) -> io::Result<(HashSet<Vec<u8>>, HashSet<Vec<u8>>)> {
+    ) -> io::Result<(HashSet<Vec<u8>>, HashSet<Vec<u8>>, u64)> {
         let renames: RenameSeq = ops
             .iter()
             .filter(|o| o.kind == OpKind::Rename)
@@ -264,12 +286,36 @@ impl Resolver {
         let mut changed_positional: HashSet<Vec<u8>> = HashSet::new();
         let mut deleted: HashSet<Vec<u8>> = HashSet::new();
         let mut moves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // Atime-filter bookkeeping, keyed by final (fresh) name:
+        // utime_cand holds the stream mtime of the last set_times
+        // record implicating the name (None = the record carried
+        // no decodable mtime); subst holds every name implicated
+        // by any other operation. A changed name present in
+        // utime_cand and absent from subst is a drop candidate.
+        let mut utime_cand: HashMap<Vec<u8>, Option<(i64, u32)>> = HashMap::new();
+        let mut subst: HashSet<Vec<u8>> = HashSet::new();
 
         for op in ops {
             let path = &op.path;
             match op.kind {
                 OpKind::Create | OpKind::Modify => {
                     let f = final_name(&renames, path, op.seq);
+                    subst.insert(f.clone());
+                    if self.in_new(&f) {
+                        changed_inode.insert(f);
+                    } else if !is_temp(&f) && !is_temp(path) {
+                        self.events.push(Event {
+                            kind: "op-path-unresolved",
+                            path: path.clone(),
+                        });
+                    }
+                }
+                OpKind::Utime => {
+                    // Resolves exactly like a Modify; the only
+                    // difference is the candidacy record (and the
+                    // absence of a substantive mark).
+                    let f = final_name(&renames, path, op.seq);
+                    utime_cand.insert(f.clone(), op.mtime);
                     if self.in_new(&f) {
                         changed_inode.insert(f);
                     } else if !is_temp(&f) && !is_temp(path) {
@@ -281,6 +327,7 @@ impl Resolver {
                 }
                 OpKind::Link => {
                     let f = final_name(&renames, path, op.seq);
+                    subst.insert(f.clone());
                     if self.in_new(&f) {
                         changed_inode.insert(f);
                     } else if !is_temp(&f) {
@@ -303,6 +350,7 @@ impl Resolver {
                     if let Some(m) = self.meta_old(&o) {
                         if m.typ == Typ::File {
                             for name in self.fresh_names_of_inode(m.ino)? {
+                                subst.insert(name.clone());
                                 changed_inode.insert(name);
                             }
                         }
@@ -332,13 +380,23 @@ impl Resolver {
         // Hardlink sibling expansion over inode-changed paths only:
         // an inode change applies to every name of the inode, but a
         // positional change of one name says nothing about the
-        // inode's other names elsewhere in the tree.
+        // inode's other names elsewhere in the tree. The atime
+        // bookkeeping follows the same propagation: a name reached
+        // from a substantive operation is substantive; a name
+        // reached only from a utime candidate inherits the
+        // candidacy (same inode, hence same mtime).
         let mut expanded: HashSet<Vec<u8>> = HashSet::new();
         for p in &changed_inode {
             expanded.insert(p.clone());
             if let Some(m) = self.meta_new(p) {
                 if m.typ == Typ::File && m.nlink > 1 {
+                    let cand_mtime = utime_cand.get(p).copied();
                     for name in self.fresh_names_of_inode(m.ino)? {
+                        if subst.contains(p) {
+                            subst.insert(name.clone());
+                        } else if let Some(mt) = cand_mtime {
+                            utime_cand.entry(name.clone()).or_insert(mt);
+                        }
                         expanded.insert(name);
                     }
                 }
@@ -381,24 +439,183 @@ impl Resolver {
             }
         }
 
-        let changed: HashSet<Vec<u8>> =
+        let mut changed: HashSet<Vec<u8>> =
             changed_inode.union(&changed_positional).cloned().collect();
+
+        // The atime-only filter. A candidate is a changed name
+        // whose implicating operations were all set_times records
+        // (present in utime_cand, absent from subst) and which is
+        // not positionally changed. It is dropped only on positive
+        // proof: the stream mtime exists and equals the retained
+        // tree's mtime for the same path to the nanosecond. Every
+        // other outcome (no stream mtime, no retained path, mtimes
+        // apart) keeps the name in the changed set.
+        let mut atime_only: u64 = 0;
+        if !utime_cand.is_empty() {
+            let candidates: Vec<Vec<u8>> = changed
+                .iter()
+                .filter(|p| {
+                    utime_cand.contains_key(*p)
+                        && !subst.contains(*p)
+                        && !changed_positional.contains(*p)
+                })
+                .cloned()
+                .collect();
+            for p in candidates {
+                let stream_mtime = utime_cand.get(&p).copied().flatten();
+                let proven = match (stream_mtime, self.meta_old(&p)) {
+                    (Some((sec, nsec)), Some(m)) => {
+                        m.mtime.0 == sec && m.mtime.1 == nsec as i64
+                    }
+                    _ => false,
+                };
+                if proven {
+                    changed.remove(&p);
+                    atime_only += 1;
+                }
+            }
+        }
+
         let mut final_deleted: HashSet<Vec<u8>> = HashSet::new();
         for p in &deleted {
             if self.in_old(p) && !self.in_new(p) && !changed.contains(p) {
                 final_deleted.insert(p.clone());
             }
         }
-        Ok((changed, final_deleted))
+        Ok((changed, final_deleted, atime_only))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn ren(seq: u64, src: &str, dst: &str) -> (u64, Vec<u8>, Vec<u8>) {
         (seq, src.as_bytes().to_vec(), dst.as_bytes().to_vec())
+    }
+
+    // -- the atime-only filter ------------------------------------
+    // The resolver only ever lstats these trees (no btrfs needed):
+    // retained/ and fresh/ are plain temp directories, and the ops
+    // are the classified records a real stream would have carried.
+    fn temp_tree(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "p6-resolve-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let old = base.join("retained");
+        let new = base.join("fresh");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        (old, new)
+    }
+
+    fn put(root: &Path, rel: &str) {
+        let p = root.join(rel);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&p, b"x").unwrap();
+        let f = fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789))
+            .unwrap();
+    }
+
+    fn mtime_of(root: &Path, rel: &str) -> (i64, u32) {
+        let md = fs::symlink_metadata(root.join(rel)).unwrap();
+        (md.mtime(), md.mtime_nsec() as u32)
+    }
+
+    fn op(seq: u64, kind: OpKind, path: &str, mtime: Option<(i64, u32)>) -> Op {
+        Op {
+            seq,
+            kind,
+            path: path.as_bytes().to_vec(),
+            aux: None,
+            mtime,
+        }
+    }
+
+    fn resolve(old: &Path, new: &Path, ops: &[Op]) -> (HashSet<Vec<u8>>, u64) {
+        let mut r = Resolver::new(old.to_path_buf(), new.to_path_buf()).unwrap();
+        let (changed, _deleted, atime_only) = r.resolve(ops).unwrap();
+        (changed, atime_only)
+    }
+
+    #[test]
+    fn utime_only_dropped_when_mtime_unmoved() {
+        let (old, new) = temp_tree("drop");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let mt = mtime_of(&old, "f.bin");
+        let (changed, atime_only) =
+            resolve(&old, &new, &[op(1, OpKind::Utime, "f.bin", Some(mt))]);
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        assert_eq!(atime_only, 1);
+    }
+
+    #[test]
+    fn utime_kept_when_mtime_moved() {
+        let (old, new) = temp_tree("moved");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let (sec, nsec) = mtime_of(&old, "f.bin");
+        let (changed, atime_only) = resolve(
+            &old,
+            &new,
+            &[op(1, OpKind::Utime, "f.bin", Some((sec + 5, nsec)))],
+        );
+        assert!(changed.contains(b"f.bin".as_slice()));
+        assert_eq!(atime_only, 0);
+    }
+
+    #[test]
+    fn utime_kept_without_stream_mtime() {
+        let (old, new) = temp_tree("nostream");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let (changed, atime_only) =
+            resolve(&old, &new, &[op(1, OpKind::Utime, "f.bin", None)]);
+        assert!(changed.contains(b"f.bin".as_slice()));
+        assert_eq!(atime_only, 0);
+    }
+
+    #[test]
+    fn utime_kept_when_absent_from_retained() {
+        let (old, new) = temp_tree("newfile");
+        put(&new, "new.bin");
+        let (changed, atime_only) = resolve(
+            &old,
+            &new,
+            &[op(
+                1,
+                OpKind::Utime,
+                "new.bin",
+                Some((1_700_000_000, 123_456_789)),
+            )],
+        );
+        assert!(changed.contains(b"new.bin".as_slice()));
+        assert_eq!(atime_only, 0);
+    }
+
+    #[test]
+    fn utime_plus_write_is_kept() {
+        let (old, new) = temp_tree("pluswrite");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let mt = mtime_of(&old, "f.bin");
+        let (changed, atime_only) = resolve(
+            &old,
+            &new,
+            &[
+                op(1, OpKind::Utime, "f.bin", Some(mt)),
+                op(2, OpKind::Modify, "f.bin", None),
+            ],
+        );
+        assert!(changed.contains(b"f.bin".as_slice()));
+        assert_eq!(atime_only, 0);
     }
 
     #[test]

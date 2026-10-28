@@ -22,6 +22,9 @@
 //!   2. fresh := read-only snapshot of the root, sync.
 //!   3. diff: `btrfs send --no-data` retained -> fresh, parsed by
 //!      the streaming TLV parser into changed/deleted lists.
+//!      Changes the resolver proves to be pure atime updates
+//!      (set_times records only, mtime unmoved) are excluded from
+//!      the changed list and reported as an atime_only count.
 //!   4. backup: per target, a patch-mode backup reading from the
 //!      fresh snapshot; it must engage, a decline is a producer
 //!      failure. Records the "backed-up" phase marker.
@@ -214,6 +217,7 @@ pub struct Producer {
     snapshot_s: f64,
     diff_s: f64,
     backup_s: f64,
+    atime_only: u64,
 }
 
 impl Producer {
@@ -257,6 +261,7 @@ impl Producer {
             snapshot_s: 0.0,
             diff_s: 0.0,
             backup_s: 0.0,
+            atime_only: 0,
         }
     }
 
@@ -450,7 +455,9 @@ impl Producer {
         Ok(())
     }
 
-    fn step3_diff(&mut self) -> Result<(HashSet<Vec<u8>>, HashSet<Vec<u8>>), String> {
+    fn step3_diff(
+        &mut self,
+    ) -> Result<(HashSet<Vec<u8>>, HashSet<Vec<u8>>), String> {
         maybe_kill("3");
         log("STEP 3: send diff");
         let t0 = Instant::now();
@@ -464,20 +471,23 @@ impl Producer {
         } else {
             self.diff_via_pipe(&parent)
         };
-        let (changed, deleted) = outcome.map_err(|e| e.to_string())?;
+        let (changed, deleted, atime_only) =
+            outcome.map_err(|e| e.to_string())?;
+        self.atime_only = atime_only;
         self.diff_s = t0.elapsed().as_secs_f64();
         log(&format!(
             "STEP 3: {} changed, {} deleted",
             changed.len(),
             deleted.len()
         ));
+        log(&format!("STEP 3b: {atime_only} atime-only dropped"));
         Ok((changed, deleted))
     }
 
     fn diff_via_pipe(
         &self,
         parent: &Path,
-    ) -> Result<(HashSet<Vec<u8>>, HashSet<Vec<u8>>), ParseError> {
+    ) -> Result<(HashSet<Vec<u8>>, HashSet<Vec<u8>>, u64), ParseError> {
         let mut child = Command::new("btrfs")
             .args([
                 "send",
@@ -513,13 +523,13 @@ impl Producer {
                 ),
             )));
         }
-        Ok((outcome.changed, outcome.deleted))
+        Ok((outcome.changed, outcome.deleted, outcome.atime_only))
     }
 
     fn diff_via_spooled_stream(
         &self,
         parent: &Path,
-    ) -> Result<(HashSet<Vec<u8>>, HashSet<Vec<u8>>), ParseError> {
+    ) -> Result<(HashSet<Vec<u8>>, HashSet<Vec<u8>>, u64), ParseError> {
         // Drill path (P6_CORRUPT_STREAM): spool like the prototype,
         // flip 512 bytes at the midpoint, then parse from the file.
         let stream_path = self.state.join("stream.bin");
@@ -557,7 +567,7 @@ impl Producer {
         fs::write(&stream_path, &data)?;
         let file = fs::File::open(&stream_path)?;
         let outcome = parse_stream(file, &self.retained, &self.fresh)?;
-        Ok((outcome.changed, outcome.deleted))
+        Ok((outcome.changed, outcome.deleted, outcome.atime_only))
     }
 
     fn target_path(&self, target: &str) -> PathBuf {
@@ -846,10 +856,11 @@ impl Producer {
                 }
                 self.write_phase("prepared", Some(&self.fresh));
                 println!(
-                    "{{\"mode\": \"patch\", \"fresh\": \"{}\", \"changed\": {}, \"deleted\": {}, \"snapshot_s\": {}, \"diff_s\": {}, \"targets\": {{{}}}}}",
+                    "{{\"mode\": \"patch\", \"fresh\": \"{}\", \"changed\": {}, \"deleted\": {}, \"atime_only\": {}, \"snapshot_s\": {}, \"diff_s\": {}, \"targets\": {{{}}}}}",
                     json_escape(&fresh_s),
                     changed.len(),
                     deleted.len(),
+                    self.atime_only,
                     self.snapshot_s,
                     self.diff_s,
                     targets_json

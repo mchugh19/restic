@@ -33,9 +33,13 @@
 //! parser: creates, content changes (write, clone, truncate,
 //! fallocate, update_extent) and metadata changes (chmod, chown,
 //! utimes, xattrs) are all "modify" for list purposes, except the
-//! create commands, which are "create". The distinction does not
-//! change the output sets (both land in the changed list) but is
-//! kept because the resolver's diagnostics mirror the reference.
+//! create commands, which are "create". One deliberate divergence
+//! from the reference: set_times (utimes) is classified as its own
+//! kind, "utime", and carries the record's mtime, so the resolver
+//! can apply the atime-only filter (a path whose whole record set
+//! is utimes and whose mtime did not move is dropped from the
+//! changed list; see resolve.rs). Every other command classifies
+//! exactly as the reference does.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -44,10 +48,29 @@ use crate::crc32c::Crc32c;
 
 pub const STREAM_MAGIC: &[u8; 13] = b"btrfs-stream\0";
 
-// Attribute types used by the resolver.
+// Attribute types used by the resolver. CTIME and ATIME complete
+// the set_times timespec family; only MTIME is decoded today.
+#[allow(dead_code)]
+pub const ATTR_CTIME: u16 = 9;
+pub const ATTR_MTIME: u16 = 10;
+#[allow(dead_code)]
+pub const ATTR_ATIME: u16 = 11;
 pub const ATTR_PATH: u16 = 15;
 pub const ATTR_PATH_TO: u16 = 16;
 pub const ATTR_PATH_LINK: u16 = 17;
+
+/// Decode a btrfs_timespec attribute value: a little-endian i64
+/// seconds followed by a little-endian u32 nanoseconds, 12 bytes
+/// in all. Any other length is not a timespec this code can vouch
+/// for and yields None; the caller fails toward inclusion.
+fn decode_timespec(v: &[u8]) -> Option<(i64, u32)> {
+    if v.len() != 12 {
+        return None;
+    }
+    let sec = i64::from_le_bytes(v[0..8].try_into().ok()?);
+    let nsec = u32::from_le_bytes(v[8..12].try_into().ok()?);
+    Some((sec, nsec))
+}
 
 // Command numbers.
 pub const CMD_SUBVOL: u16 = 1;
@@ -148,6 +171,9 @@ pub enum OpKind {
     Delete,
     Link,
     Rename,
+    /// A set_times (utimes) command, kept distinct from Modify so
+    /// the resolver can apply the atime-only filter.
+    Utime,
 }
 
 /// One classified stream operation, in stream order. Paths are raw
@@ -164,6 +190,12 @@ pub struct Op {
     /// rename: the destination path; link: the existing path the new
     /// name is linked from.
     pub aux: Option<Vec<u8>>,
+    /// Utime ops only: the mtime carried by the set_times record,
+    /// as (seconds, nanoseconds). None when the record has no
+    /// decodable mtime attribute, and for every other op kind.
+    /// The resolver treats None as "cannot prove the mtime did not
+    /// move" and keeps the path in the changed list.
+    pub mtime: Option<(i64, u32)>,
 }
 
 pub struct StreamReader<R: Read> {
@@ -342,7 +374,9 @@ impl<R: Read> StreamReader<R> {
                 return Ok(None);
             };
             // Copy what we need out of the borrowed payload before
-            // the next read reuses the buffer.
+            // the next read reuses the buffer. The tuple is
+            // (kind, path, aux, mtime); the mtime is populated for
+            // set_times records only.
             let classified = match cmd {
                 CMD_SUBVOL | CMD_SNAPSHOT => None,
                 CMD_MKFILE | CMD_MKDIR | CMD_MKNOD | CMD_MKFIFO | CMD_MKSOCK
@@ -350,46 +384,59 @@ impl<R: Read> StreamReader<R> {
                     OpKind::Create,
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
                     None,
+                    None,
                 )),
                 CMD_RENAME => Some((
                     OpKind::Rename,
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
                     Some(Self::get_attr(cmd, payload, ATTR_PATH_TO)?),
+                    None,
                 )),
                 CMD_LINK => Some((
                     OpKind::Link,
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
                     Some(Self::get_attr(cmd, payload, ATTR_PATH_LINK)?),
+                    None,
                 )),
                 CMD_UNLINK | CMD_RMDIR => Some((
                     OpKind::Delete,
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
                     None,
+                    None,
+                )),
+                CMD_SET_TIMES => Some((
+                    OpKind::Utime,
+                    Self::get_attr(cmd, payload, ATTR_PATH)?,
+                    None,
+                    Self::opt_attr(cmd, payload, ATTR_MTIME)?
+                        .and_then(|v| decode_timespec(&v)),
                 )),
                 CMD_SET_XATTR | CMD_REMOVE_XATTR | CMD_WRITE | CMD_CLONE
-                | CMD_TRUNCATE | CMD_SET_MODE | CMD_SET_OWNER | CMD_SET_TIMES
+                | CMD_TRUNCATE | CMD_SET_MODE | CMD_SET_OWNER
                 | CMD_UPDATE_EXTENT => Some((
                     OpKind::Modify,
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
+                    None,
                     None,
                 )),
                 CMD_END_OR_FALLOCATE => {
                     // A payload-carrying cmd 21 is a v2 fallocate:
                     // a content change on its path.
                     match Self::opt_attr(cmd, payload, ATTR_PATH)? {
-                        Some(p) => Some((OpKind::Modify, p, None)),
+                        Some(p) => Some((OpKind::Modify, p, None, None)),
                         None => None,
                     }
                 }
                 other => return Err(StreamError::UnknownCommand(other)),
             };
-            if let Some((kind, path, aux)) = classified {
+            if let Some((kind, path, aux, mtime)) = classified {
                 self.seq += 1;
                 return Ok(Some(Op {
                     seq: self.seq,
                     kind,
                     path,
                     aux,
+                    mtime,
                 }));
             }
         }
@@ -470,6 +517,33 @@ mod tests {
         assert_eq!(ops[0].aux.as_deref(), Some(b"dirB-moved".as_slice()));
         assert_eq!(ops[1].kind, OpKind::Delete);
         assert!(r.saw_end);
+    }
+
+    #[test]
+    fn set_times_classifies_as_utime_with_mtime() {
+        fn timespec(sec: i64, nsec: u32) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&sec.to_le_bytes());
+            v.extend_from_slice(&nsec.to_le_bytes());
+            v
+        }
+        let mut st = Vec::new();
+        st.extend(attr(ATTR_PATH, b"dir/f.bin"));
+        st.extend(attr(ATTR_CTIME, &timespec(1700000003, 30)));
+        st.extend(attr(ATTR_MTIME, &timespec(1700000002, 20)));
+        st.extend(attr(ATTR_ATIME, &timespec(1700000001, 10)));
+        // A second set_times with no mtime attribute at all.
+        let mut st2 = Vec::new();
+        st2.extend(attr(ATTR_PATH, b"dir/g.bin"));
+        st2.extend(attr(ATTR_ATIME, &timespec(1700000009, 90)));
+        let data = stream(&[(CMD_SET_TIMES, st), (CMD_SET_TIMES, st2)]);
+        let mut r = StreamReader::new(Cursor::new(data)).unwrap();
+        let ops = r.read_all().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].kind, OpKind::Utime);
+        assert_eq!(ops[0].mtime, Some((1700000002, 20)));
+        assert_eq!(ops[1].kind, OpKind::Utime);
+        assert_eq!(ops[1].mtime, None);
     }
 
     #[test]
