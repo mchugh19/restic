@@ -25,8 +25,7 @@
 //!   4. backup: per target, a patch-mode backup reading from the
 //!      fresh snapshot; it must engage, a decline is a producer
 //!      failure. Records the "backed-up" phase marker.
-//!   5. rotate: delete the old retained, rename fresh -> retained,
-//!      and report the retained snapshot's pinned (exclusive) bytes.
+//!   5. rotate: delete the old retained, rename fresh -> retained.
 //!
 //! Any failure in steps 3-4 falls back to a plain full backup of
 //! every target from the fresh snapshot; afterwards the retained
@@ -215,7 +214,6 @@ pub struct Producer {
     snapshot_s: f64,
     diff_s: f64,
     backup_s: f64,
-    pin_exclusive: Option<u64>,
 }
 
 impl Producer {
@@ -259,7 +257,6 @@ impl Producer {
             snapshot_s: 0.0,
             diff_s: 0.0,
             backup_s: 0.0,
-            pin_exclusive: None,
         }
     }
 
@@ -338,27 +335,6 @@ impl Producer {
             fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))
         } else {
             Ok(())
-        }
-    }
-
-    /// Exclusive bytes of the retained snapshot: what deleting it
-    /// would free, i.e. what the rotation pins. Best-effort; the
-    /// figure is reported, never load-bearing.
-    fn measure_pin(&mut self) {
-        let retained = self.retained.to_string_lossy().into_owned();
-        if let Ok(o) = run_cmd(
-            &["btrfs", "filesystem", "du", "--raw", "-s", &retained],
-            &[],
-        ) {
-            for line in o.stdout.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 && parts[parts.len() - 1] == retained {
-                    if let Ok(ex) = parts[1].parse::<u64>() {
-                        self.pin_exclusive = Some(ex);
-                        log(&format!("PIN retained_exclusive_bytes={ex}"));
-                    }
-                }
-            }
         }
     }
 
@@ -705,7 +681,6 @@ impl Producer {
         fs::rename(&self.fresh, &self.retained)
             .map_err(|e| format!("rotate fresh -> retained: {e}"))?;
         self.write_phase("idle", Some(&self.retained));
-        self.measure_pin();
         Ok(())
     }
 
@@ -721,13 +696,9 @@ impl Producer {
     }
 
     fn timings_json(&self, total_s: f64) -> String {
-        let pin = match self.pin_exclusive {
-            Some(p) => format!(", \"pin_exclusive_bytes\": {p}"),
-            None => String::new(),
-        };
         format!(
-            "{{\"snapshot_s\": {}, \"diff_s\": {}, \"backup_s\": {}, \"total_s\": {}{}}}",
-            self.snapshot_s, self.diff_s, self.backup_s, total_s, pin
+            "{{\"snapshot_s\": {}, \"diff_s\": {}, \"backup_s\": {}, \"total_s\": {}}}",
+            self.snapshot_s, self.diff_s, self.backup_s, total_s
         )
     }
 
@@ -758,7 +729,6 @@ impl Producer {
             }
             self.write_phase("idle", Some(&self.retained));
             log("INIT: retained established");
-            self.measure_pin();
             log(&format!(
                 "TIMINGS {}",
                 self.timings_json(t_start.elapsed().as_secs_f64())
@@ -911,7 +881,6 @@ impl Producer {
                     return 1;
                 }
                 self.write_phase("idle", Some(&self.retained));
-                self.measure_pin();
                 log("finalize: retained rotated to the backed-up state");
                 0
             }
@@ -935,7 +904,6 @@ impl Producer {
                     return 1;
                 }
                 self.write_phase("idle", Some(&self.retained));
-                self.measure_pin();
                 log("finalize: retained established");
                 0
             }
