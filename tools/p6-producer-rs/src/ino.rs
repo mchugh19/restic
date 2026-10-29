@@ -9,11 +9,18 @@
 //! The layout mirrors internal/btrfs in this repository, whose
 //! implementation the project 2 gates validated: request number 35
 //! under magic 0x94, a 56-byte argument struct (inum, size,
-//! reserved[4], fspath pointer at offset 48), and a 4 KiB result
-//! container the kernel refuses to overfill (it reports the
-//! shortfall in bytes_missing instead). A shortfall is an error
-//! here, never a partial list: a truncated sibling set would
-//! silently drop a name from the changed list.
+//! reserved[4], fspath pointer at offset 48), and a result
+//! container the kernel fills with as many paths as it can.
+//!
+//! The container has a hard kernel-side limit: the kernel fills at
+//! most one page of it, however large a buffer the caller supplies
+//! (verified empirically on kernel 6.17: elem_cnt, elem_missed and
+//! bytes_missing are identical for buffers from 4 KiB to 1 MiB).
+//! An inode whose paths do not fit in that page is reported as
+//! `InoResolution::Clamped`, never as a partial list: a truncated
+//! sibling set would silently drop a name from the changed list.
+//! The caller resolves clamped inodes another way (a metadata walk
+//! of the snapshot; see resolve.rs).
 //!
 //! Needs CAP_DAC_READ_SEARCH (root in practice), like the rest of
 //! the producer.
@@ -37,15 +44,26 @@ fn ioc_ino_paths() -> u64 {
     (3u64 << 30) | (ARGS_LEN << 16) | (BTRFS_IOCTL_MAGIC << 8) | IOC_INO_PATHS_NR
 }
 
-/// All paths of `ino` relative to the root of the subvolume that
-/// `root` (an open directory handle on it) belongs to.
-///
-/// An inode with no paths in this subvolume (fully deleted between
-/// the snapshots, or a lookup the kernel rejects with ENOENT /
-/// EINVAL / ENODATA) yields an empty list; that case is a normal
-/// outcome of the delete-side sibling rule, not a failure. Any
-/// other error is fatal to the caller.
-pub fn ino_paths(root: &File, ino: u64) -> io::Result<Vec<Vec<u8>>> {
+/// The outcome of an inode-to-paths lookup.
+pub enum InoResolution {
+    /// Every path of the inode, relative to the root of the
+    /// subvolume that `root` belongs to. An inode with no paths in
+    /// this subvolume (fully deleted between the snapshots, or a
+    /// lookup the kernel rejects with ENOENT / EINVAL / ENODATA)
+    /// yields an empty list; that case is a normal outcome of the
+    /// delete-side sibling rule, not a failure.
+    Complete(Vec<Vec<u8>>),
+    /// The inode has more paths than fit in the kernel's one-page
+    /// container; the paths that did fit are discarded. The caller
+    /// must resolve this inode another way.
+    Clamped,
+}
+
+/// All paths of `ino` within the subvolume that `root` (an open
+/// directory handle on it) belongs to, or `InoResolution::Clamped`
+/// when the kernel could not fit them all. Any other error is
+/// fatal to the caller.
+pub fn ino_paths(root: &File, ino: u64) -> io::Result<InoResolution> {
     // struct btrfs_ioctl_ino_path_args (56 bytes): inum u64, size
     // u32 (+4 padding), reserved u64[4], fspath pointer at 48.
     let mut container = vec![0u8; CONTAINER_LEN];
@@ -64,7 +82,7 @@ pub fn ino_paths(root: &File, ino: u64) -> io::Result<Vec<Vec<u8>>> {
         let e = io::Error::last_os_error();
         match e.raw_os_error() {
             // ENOENT, EINVAL, ENODATA: no such inode here.
-            Some(2) | Some(22) | Some(61) => return Ok(Vec::new()),
+            Some(2) | Some(22) | Some(61) => return Ok(InoResolution::Complete(Vec::new())),
             _ => return Err(e),
         }
     }
@@ -73,13 +91,9 @@ pub fn ino_paths(root: &File, ino: u64) -> io::Result<Vec<Vec<u8>>> {
     // to NUL-terminated strings, each offset relative to the start
     // of the val array (container + 16).
     let missing = u32::from_le_bytes(container[4..8].try_into().unwrap());
-    if missing != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "ino_paths({ino}): result needs {missing} more bytes (kernel 4 KiB clamp); refusing a partial path list"
-            ),
-        ));
+    let missed = u32::from_le_bytes(container[12..16].try_into().unwrap());
+    if missing != 0 || missed != 0 {
+        return Ok(InoResolution::Clamped);
     }
     let cnt = u32::from_le_bytes(container[8..12].try_into().unwrap()) as usize;
     let mut paths = Vec::with_capacity(cnt);
@@ -100,5 +114,5 @@ pub fn ino_paths(root: &File, ino: u64) -> io::Result<Vec<Vec<u8>>> {
         }
         paths.push(container[start..end].to_vec());
     }
-    Ok(paths)
+    Ok(InoResolution::Complete(paths))
 }

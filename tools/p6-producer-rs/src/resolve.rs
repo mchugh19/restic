@@ -11,6 +11,11 @@
 //! lstat for membership and type, a recursive listing only of
 //! subtrees that a directory move or deletion implicates, and
 //! BTRFS_IOC_INO_PATHS for the fresh names of a changed inode.
+//! The one exception to "only what the stream named": an inode
+//! whose names do not fit in the kernel's one-page INO_PATHS
+//! container is resolved by a single metadata walk of the fresh
+//! tree (built once, then cached), because the ioctl cannot
+//! return a complete list for it at any buffer size.
 //!
 //! Semantics, as in the reference:
 //!   * Names in the stream are valid at their point in the stream,
@@ -146,6 +151,10 @@ pub struct Resolver {
     new_fd: File,
     old_meta: HashMap<Vec<u8>, Option<Meta>>,
     new_meta: HashMap<Vec<u8>, Option<Meta>>,
+    /// Fresh-tree inode -> names map, built by the one walk a
+    /// page-clamped inode forces (see fresh_names_by_walk); None
+    /// until the first clamped inode appears.
+    new_by_ino: Option<HashMap<u64, Vec<Vec<u8>>>>,
     pub events: Vec<Event>,
 }
 
@@ -158,6 +167,7 @@ impl Resolver {
             new_fd,
             old_meta: HashMap::new(),
             new_meta: HashMap::new(),
+            new_by_ino: None,
             events: Vec::new(),
         })
     }
@@ -211,8 +221,85 @@ impl Resolver {
         self.meta_new(rel).is_some()
     }
 
-    fn fresh_names_of_inode(&self, ino: u64) -> io::Result<Vec<Vec<u8>>> {
-        ino::ino_paths(&self.new_fd, ino)
+    fn fresh_names_of_inode(&mut self, ino: u64) -> io::Result<Vec<Vec<u8>>> {
+        match ino::ino_paths(&self.new_fd, ino)? {
+            ino::InoResolution::Complete(paths) => Ok(paths),
+            ino::InoResolution::Clamped => {
+                self.events.push(Event {
+                    kind: "ino-paths-clamped",
+                    path: ino.to_string().into_bytes(),
+                });
+                Ok(self.fresh_names_by_walk(ino))
+            }
+        }
+    }
+
+    /// Every fresh name of `ino`, found by walking the fresh tree.
+    /// Used only for inodes whose path list the kernel's one-page
+    /// INO_PATHS container cannot hold. The walk runs at most once
+    /// per resolution; its inode -> names map is cached, so
+    /// further clamped inodes are free. It mirrors subtree_old's
+    /// treatment of nested subvolumes (a subvolume root, inode
+    /// 256, is recorded as a leaf and not descended into: its
+    /// contents belong to that subvolume, not this one) and feeds
+    /// the new_meta cache the way subtree_old feeds old_meta.
+    fn fresh_names_by_walk(&mut self, ino: u64) -> Vec<Vec<u8>> {
+        if self.new_by_ino.is_none() {
+            let mut by_ino: HashMap<u64, Vec<Vec<u8>>> = HashMap::new();
+            let mut stack: Vec<Vec<u8>> = vec![Vec::new()];
+            while let Some(d) = stack.pop() {
+                let full = if d.is_empty() {
+                    self.new_root.clone()
+                } else {
+                    self.new_root
+                        .join(Path::new(std::ffi::OsStr::from_bytes(&d)))
+                };
+                let entries = match fs::read_dir(&full) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let mut rel = d.clone();
+                    if !rel.is_empty() {
+                        rel.push(b'/');
+                    }
+                    rel.extend_from_slice(name.as_bytes());
+                    if let Ok(md) = entry.metadata() {
+                        let ft = md.file_type();
+                        let typ = if ft.is_dir() {
+                            Typ::Dir
+                        } else if ft.is_file() {
+                            Typ::File
+                        } else {
+                            Typ::Other
+                        };
+                        self.new_meta.insert(
+                            rel.clone(),
+                            Some(Meta {
+                                typ,
+                                ino: md.ino(),
+                                nlink: md.nlink(),
+                                mtime: (md.mtime(), md.mtime_nsec()),
+                            }),
+                        );
+                        if ft.is_file() {
+                            by_ino.entry(md.ino()).or_default().push(rel.clone());
+                        }
+                        if ft.is_dir() && md.ino() != 256 {
+                            stack.push(rel);
+                        }
+                    }
+                }
+            }
+            self.new_by_ino = Some(by_ino);
+        }
+        self.new_by_ino
+            .as_ref()
+            .unwrap()
+            .get(&ino)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// All descendants of `dir` in the retained tree (relative
@@ -616,6 +703,32 @@ mod tests {
         );
         assert!(changed.contains(b"f.bin".as_slice()));
         assert_eq!(atime_only, 0);
+    }
+
+    #[test]
+    fn walk_finds_every_hardlink_name() {
+        let (old, new) = temp_tree("walk");
+        put(&new, "a/f.bin");
+        let src = new.join("a/f.bin");
+        fs::create_dir_all(new.join("b")).unwrap();
+        fs::create_dir_all(new.join("c/deep")).unwrap();
+        fs::hard_link(&src, new.join("b/f-link.bin")).unwrap();
+        fs::hard_link(&src, new.join("c/deep/f-link2.bin")).unwrap();
+        put(&new, "solo.bin");
+        let ino = fs::symlink_metadata(&src).unwrap().ino();
+        let mut r = Resolver::new(old, new).unwrap();
+        let mut names = r.fresh_names_by_walk(ino);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                b"a/f.bin".to_vec(),
+                b"b/f-link.bin".to_vec(),
+                b"c/deep/f-link2.bin".to_vec()
+            ]
+        );
+        // An inode the tree does not contain resolves to no names.
+        assert!(r.fresh_names_by_walk(ino + 999_999).is_empty());
     }
 
     #[test]

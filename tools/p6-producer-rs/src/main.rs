@@ -203,11 +203,17 @@ fn cmd_ino(flags: &HashMap<String, String>) -> i32 {
         }
     };
     match ino::ino_paths(&f, ino) {
-        Ok(paths) => {
+        Ok(ino::InoResolution::Complete(paths)) => {
             for p in &paths {
                 println!("{}", escape_json_bytes(p));
             }
             0
+        }
+        Ok(ino::InoResolution::Clamped) => {
+            eprintln!(
+                "ino: {ino} has more paths than the kernel's one-page container holds"
+            );
+            1
         }
         Err(e) => {
             eprintln!("ino: {e}");
