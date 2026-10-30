@@ -113,10 +113,16 @@ def main():
     for f in all_files[400:480:20]:
         os.unlink(os.path.join(ROOT, f))
         exp_deleted.add(f)
-    # substantive: delete one whole directory (first leaf dir with
-    # exactly the files we can enumerate)
+    # substantive: delete one whole directory. The victim is the
+    # lexicographically LAST eligible leaf directory: the edit
+    # indices above all land in the first directories, and an
+    # earlier build of this fixture picked the first leaf
+    # (d00/s00), which held the rewrite targets, so the
+    # expectation bookkeeping recorded as changed five files
+    # the fixture had in fact deleted. The disjointness assert
+    # keeps that class of error from coming back silently.
     victim_dir = None
-    for d in all_dirs:
+    for d in sorted(all_dirs, reverse=True):
         if d == ".":
             continue
         full = os.path.join(ROOT, d)
@@ -127,6 +133,9 @@ def main():
             for e in entries:
                 exp_deleted.add(os.path.join(d, e))
             break
+    assert victim_dir
+    assert not (exp_deleted & exp_changed), \
+        "victim dir overlaps the edited set"
     if victim_dir:
         import shutil
         shutil.rmtree(os.path.join(ROOT, victim_dir))

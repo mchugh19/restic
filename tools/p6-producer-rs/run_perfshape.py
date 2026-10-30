@@ -2,7 +2,7 @@
 """Performance gate for the atime filter: the mass-atime shape
 the Phase A corpus never had.
 
-Fixture (built by p6-perfshape-setup.py on the testbed, recorded
+Fixture (built by build_perfshape.py in this crate, recorded
 in /data/p6/perfshape/expected.json): the full 200k-file corpus
 reflink-copied into a subvolume, a retained snapshot, an
 atime-only sweep over every entry (atime set, mtime preserved to
