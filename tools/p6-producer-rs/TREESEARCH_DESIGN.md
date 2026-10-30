@@ -167,17 +167,17 @@ case, v5 behaves byte-for-byte like v4.
 
 ## Performance shape and budget
 
-`run_perfshape.py` (this crate) builds the shape the v3/v4
+`build_perfshape.py` (this crate) builds the shape the v3/v4
 gates never had: the full 200k-file corpus reflink-copied into
 a subvolume, a retained snapshot, an atime-only sweep over
 every entry (files, directories, symlinks; atime set to now,
 mtime preserved to the nanosecond), a handful of substantive
 changes mixed in (rewrites, appends, mtime-only traps, chmod,
 creates, deletes, a directory deletion, renames, a hardlink),
-a fresh snapshot, and one spooled send stream. It records the
-send-only wall time for the identical shape and machine, then
-times `parse` for the v4 binary and the v5 binary against the
-same stream and trees.
+a fresh snapshot, and one spooled send stream; it records the
+send-only wall time for the identical shape and machine.
+`run_perfshape.py` then times `parse` for the v4 binary and
+the v5 binary against the same stream and trees.
 
 Budget, derived from the measured send-only time `S` on that
 shape: **v5 parse wall time <= S + 120 s**, and the lists and
