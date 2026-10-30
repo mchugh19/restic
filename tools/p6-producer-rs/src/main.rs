@@ -29,6 +29,7 @@
 
 mod crc32c;
 mod ino;
+mod treesearch;
 mod parse;
 mod producer;
 mod resolve;

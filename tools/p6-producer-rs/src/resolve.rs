@@ -41,7 +41,12 @@
 //! implicates it is a set_times record (no create, content,
 //! metadata, link or rename operation) and the mtime carried by
 //! its (last) set_times record equals, to the nanosecond, the
-//! mtime of the same path in the retained snapshot. Atime-only
+//! mtime of the same inode in the retained snapshot. That
+//! retained value comes from one bulk TREE_SEARCH_V2 pass over
+//! the retained tree (treesearch.rs), keyed by the candidate's
+//! fresh inode, with the original per-path retained lstat as
+//! the fallback for anything the map does not cover (see
+//! prove_retained_mtime and TREESEARCH_DESIGN.md). Atime-only
 //! paths are removed from the changed set and counted separately:
 //! pure access-time updates (a backup's own reads, an integrity
 //! scan walking the tree) are not changes restic needs to hear
@@ -61,6 +66,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ino;
 use crate::stream::{Op, OpKind};
+use crate::treesearch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Typ {
@@ -148,6 +154,7 @@ fn retained_name(renames: &RenameSeq, path: &[u8], seq: u64) -> Vec<u8> {
 pub struct Resolver {
     old_root: PathBuf,
     new_root: PathBuf,
+    old_fd: File,
     new_fd: File,
     old_meta: HashMap<Vec<u8>, Option<Meta>>,
     new_meta: HashMap<Vec<u8>, Option<Meta>>,
@@ -155,19 +162,32 @@ pub struct Resolver {
     /// page-clamped inode forces (see fresh_names_by_walk); None
     /// until the first clamped inode appears.
     new_by_ino: Option<HashMap<u64, Vec<Vec<u8>>>>,
+    /// Retained-tree inode -> mtime map from one bulk
+    /// TREE_SEARCH_V2 pass (see treesearch.rs), the atime
+    /// filter's fast source for the retained side of its proof.
+    /// Built lazily on the first candidate that needs a proof;
+    /// None when the build failed or has not happened, in which
+    /// case every proof takes the per-path stat path, exactly
+    /// as before.
+    old_mtime_map: Option<HashMap<u64, (i64, i64)>>,
+    map_tried: bool,
     pub events: Vec<Event>,
 }
 
 impl Resolver {
     pub fn new(old_root: PathBuf, new_root: PathBuf) -> io::Result<Self> {
+        let old_fd = File::open(&old_root)?;
         let new_fd = File::open(&new_root)?;
         Ok(Resolver {
             old_root,
             new_root,
+            old_fd,
             new_fd,
             old_meta: HashMap::new(),
             new_meta: HashMap::new(),
             new_by_ino: None,
+            old_mtime_map: None,
+            map_tried: false,
             events: Vec::new(),
         })
     }
@@ -211,6 +231,73 @@ impl Resolver {
         let m = Self::lstat(&self.new_root, rel);
         self.new_meta.insert(rel.to_vec(), m);
         m
+    }
+
+    /// Build the retained inode -> mtime map on first demand
+    /// (one TREE_SEARCH_V2 pass over the retained snapshot; see
+    /// treesearch.rs). A failed build is not an error for the
+    /// run: the map stays absent, every proof takes the stat
+    /// path, and the outcome is a diagnostic event either way,
+    /// mirroring the ino-paths-clamped event.
+    fn ensure_old_mtime_map(&mut self) {
+        if self.map_tried {
+            return;
+        }
+        self.map_tried = true;
+        match treesearch::inode_mtimes(&self.old_fd) {
+            Ok(map) => {
+                self.events.push(Event {
+                    kind: "tree-search-map",
+                    path: map.len().to_string().into_bytes(),
+                });
+                self.old_mtime_map = Some(map);
+            }
+            Err(_) => {
+                self.events.push(Event {
+                    kind: "tree-search-unavailable",
+                    path: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// The atime filter's proof for one candidate: the stream
+    /// mtime equals the retained tree's mtime for the same
+    /// inode, to the nanosecond.
+    ///
+    /// Fast source: the candidate's fresh inode (from the
+    /// fresh-tree lstat the resolver already performed and
+    /// cached for this path) keyed into the tree-search map.
+    /// Keying by inode is the same comparison the stat makes:
+    /// mtime is a per-inode fact, and a candidate is by
+    /// construction a path no substantive op implicated, so
+    /// the inode at that path is the retained tree's inode of
+    /// the same number (snapshot lineage shares one inode
+    /// space; see TREESEARCH_DESIGN.md). Two classes never use
+    /// the map: inode 256 (every subvolume root carries it, so
+    /// it collides with the retained root's own entry) and map
+    /// misses (short items, nested-subvolume trees the search
+    /// does not span, any gap at all). Both, and a failed map
+    /// build, take the original proof verbatim: an lstat in the
+    /// retained tree at the candidate's path.
+    fn prove_retained_mtime(&mut self, rel: &[u8], stream_mtime: (i64, u32)) -> bool {
+        if let Some(m) = self.meta_new(rel) {
+            if m.ino != 256 {
+                self.ensure_old_mtime_map();
+                if let Some(map) = &self.old_mtime_map {
+                    if let Some(&(sec, nsec)) = map.get(&m.ino) {
+                        return sec == stream_mtime.0
+                            && nsec == stream_mtime.1 as i64;
+                    }
+                }
+            }
+        }
+        match self.meta_old(rel) {
+            Some(m) => {
+                m.mtime.0 == stream_mtime.0 && m.mtime.1 == stream_mtime.1 as i64
+            }
+            None => false,
+        }
     }
 
     fn in_old(&mut self, rel: &[u8]) -> bool {
@@ -534,9 +621,10 @@ impl Resolver {
         // (present in utime_cand, absent from subst) and which is
         // not positionally changed. It is dropped only on positive
         // proof: the stream mtime exists and equals the retained
-        // tree's mtime for the same path to the nanosecond. Every
-        // other outcome (no stream mtime, no retained path, mtimes
-        // apart) keeps the name in the changed set.
+        // tree's mtime for the same inode to the nanosecond (see
+        // prove_retained_mtime for where that value comes from).
+        // Every other outcome (no stream mtime, no retained path,
+        // mtimes apart) keeps the name in the changed set.
         let mut atime_only: u64 = 0;
         if !utime_cand.is_empty() {
             let candidates: Vec<Vec<u8>> = changed
@@ -550,11 +638,9 @@ impl Resolver {
                 .collect();
             for p in candidates {
                 let stream_mtime = utime_cand.get(&p).copied().flatten();
-                let proven = match (stream_mtime, self.meta_old(&p)) {
-                    (Some((sec, nsec)), Some(m)) => {
-                        m.mtime.0 == sec && m.mtime.1 == nsec as i64
-                    }
-                    _ => false,
+                let proven = match stream_mtime {
+                    Some(mt) => self.prove_retained_mtime(&p, mt),
+                    None => false,
                 };
                 if proven {
                     changed.remove(&p);
@@ -685,6 +771,86 @@ mod tests {
         );
         assert!(changed.contains(b"new.bin".as_slice()));
         assert_eq!(atime_only, 0);
+    }
+
+    fn resolve_with_map(
+        old: &Path,
+        new: &Path,
+        ops: &[Op],
+        map: HashMap<u64, (i64, i64)>,
+    ) -> (HashSet<Vec<u8>>, u64) {
+        let mut r = Resolver::new(old.to_path_buf(), new.to_path_buf()).unwrap();
+        r.map_tried = true;
+        r.old_mtime_map = Some(map);
+        let (changed, _deleted, atime_only) = r.resolve(ops).unwrap();
+        (changed, atime_only)
+    }
+
+    #[test]
+    fn map_hit_equal_drops_on_map_authority() {
+        // The map is the proof's source when it covers the
+        // inode: here it deliberately disagrees with what a
+        // retained lstat would say (the retained file's mtime
+        // is the put() constant, the stream mtime is a second
+        // later), and the map, keyed by the fresh inode, carries
+        // the stream value. The drop follows the map.
+        let (old, new) = temp_tree("mapdrop");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let ino = fs::symlink_metadata(new.join("f.bin")).unwrap().ino();
+        let (sec, nsec) = mtime_of(&old, "f.bin");
+        let stream_mt = (sec + 1, nsec);
+        let mut map = HashMap::new();
+        map.insert(ino, (stream_mt.0, stream_mt.1 as i64));
+        let (changed, atime_only) = resolve_with_map(
+            &old,
+            &new,
+            &[op(1, OpKind::Utime, "f.bin", Some(stream_mt))],
+            map,
+        );
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        assert_eq!(atime_only, 1);
+    }
+
+    #[test]
+    fn map_hit_unequal_keeps_even_when_stat_would_drop() {
+        // The negative verdict is the map's too: the stream
+        // mtime equals the retained lstat's, but the map entry
+        // for the inode says the retained mtime is a second
+        // later, so the path stays changed.
+        let (old, new) = temp_tree("mapkeep");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let ino = fs::symlink_metadata(new.join("f.bin")).unwrap().ino();
+        let mt = mtime_of(&old, "f.bin");
+        let mut map = HashMap::new();
+        map.insert(ino, (mt.0 + 1, mt.1 as i64));
+        let (changed, atime_only) = resolve_with_map(
+            &old,
+            &new,
+            &[op(1, OpKind::Utime, "f.bin", Some(mt))],
+            map,
+        );
+        assert!(changed.contains(b"f.bin".as_slice()));
+        assert_eq!(atime_only, 0);
+    }
+
+    #[test]
+    fn map_miss_falls_back_to_stat_proof() {
+        // An empty (but successfully built) map proves nothing;
+        // the original stat proof decides, and it drops here.
+        let (old, new) = temp_tree("mapmiss");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let mt = mtime_of(&old, "f.bin");
+        let (changed, atime_only) = resolve_with_map(
+            &old,
+            &new,
+            &[op(1, OpKind::Utime, "f.bin", Some(mt))],
+            HashMap::new(),
+        );
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        assert_eq!(atime_only, 1);
     }
 
     #[test]
