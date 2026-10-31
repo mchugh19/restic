@@ -38,8 +38,12 @@
 //! kind, "utime", and carries the record's mtime, so the resolver
 //! can apply the atime-only filter (a path whose whole record set
 //! is utimes and whose mtime did not move is dropped from the
-//! changed list; see resolve.rs). Every other command classifies
-//! exactly as the reference does.
+//! changed list; see resolve.rs). Since v6 the record's ctime is
+//! carried too: it is the resolver's first-line atime proof (a
+//! ctime older than the retained snapshot's creation cannot
+//! belong to an inode that changed inside the interval; see
+//! resolve.rs and CTIME_DESIGN.md). Every other command
+//! classifies exactly as the reference does.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -48,9 +52,9 @@ use crate::crc32c::Crc32c;
 
 pub const STREAM_MAGIC: &[u8; 13] = b"btrfs-stream\0";
 
-// Attribute types used by the resolver. CTIME and ATIME complete
-// the set_times timespec family; only MTIME is decoded today.
-#[allow(dead_code)]
+// Attribute types used by the resolver. CTIME and MTIME of the
+// set_times timespec family are decoded (ATIME completes the
+// family; nothing consumes it today).
 pub const ATTR_CTIME: u16 = 9;
 pub const ATTR_MTIME: u16 = 10;
 #[allow(dead_code)]
@@ -196,6 +200,11 @@ pub struct Op {
     /// The resolver treats None as "cannot prove the mtime did not
     /// move" and keeps the path in the changed list.
     pub mtime: Option<(i64, u32)>,
+    /// Utime ops only: the ctime carried by the set_times record,
+    /// as (seconds, nanoseconds), with the same None convention
+    /// as mtime. The resolver's ctime proof treats None as
+    /// "cannot prove" and falls through to the stat proof.
+    pub ctime: Option<(i64, u32)>,
 }
 
 pub struct StreamReader<R: Read> {
@@ -375,8 +384,8 @@ impl<R: Read> StreamReader<R> {
             };
             // Copy what we need out of the borrowed payload before
             // the next read reuses the buffer. The tuple is
-            // (kind, path, aux, mtime); the mtime is populated for
-            // set_times records only.
+            // (kind, path, aux, mtime, ctime); the times are
+            // populated for set_times records only.
             let classified = match cmd {
                 CMD_SUBVOL | CMD_SNAPSHOT => None,
                 CMD_MKFILE | CMD_MKDIR | CMD_MKNOD | CMD_MKFIFO | CMD_MKSOCK
@@ -385,11 +394,13 @@ impl<R: Read> StreamReader<R> {
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
                     None,
                     None,
+                    None,
                 )),
                 CMD_RENAME => Some((
                     OpKind::Rename,
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
                     Some(Self::get_attr(cmd, payload, ATTR_PATH_TO)?),
+                    None,
                     None,
                 )),
                 CMD_LINK => Some((
@@ -397,10 +408,12 @@ impl<R: Read> StreamReader<R> {
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
                     Some(Self::get_attr(cmd, payload, ATTR_PATH_LINK)?),
                     None,
+                    None,
                 )),
                 CMD_UNLINK | CMD_RMDIR => Some((
                     OpKind::Delete,
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
+                    None,
                     None,
                     None,
                 )),
@@ -410,6 +423,8 @@ impl<R: Read> StreamReader<R> {
                     None,
                     Self::opt_attr(cmd, payload, ATTR_MTIME)?
                         .and_then(|v| decode_timespec(&v)),
+                    Self::opt_attr(cmd, payload, ATTR_CTIME)?
+                        .and_then(|v| decode_timespec(&v)),
                 )),
                 CMD_SET_XATTR | CMD_REMOVE_XATTR | CMD_WRITE | CMD_CLONE
                 | CMD_TRUNCATE | CMD_SET_MODE | CMD_SET_OWNER
@@ -418,18 +433,19 @@ impl<R: Read> StreamReader<R> {
                     Self::get_attr(cmd, payload, ATTR_PATH)?,
                     None,
                     None,
+                    None,
                 )),
                 CMD_END_OR_FALLOCATE => {
                     // A payload-carrying cmd 21 is a v2 fallocate:
                     // a content change on its path.
                     match Self::opt_attr(cmd, payload, ATTR_PATH)? {
-                        Some(p) => Some((OpKind::Modify, p, None, None)),
+                        Some(p) => Some((OpKind::Modify, p, None, None, None)),
                         None => None,
                     }
                 }
                 other => return Err(StreamError::UnknownCommand(other)),
             };
-            if let Some((kind, path, aux, mtime)) = classified {
+            if let Some((kind, path, aux, mtime, ctime)) = classified {
                 self.seq += 1;
                 return Ok(Some(Op {
                     seq: self.seq,
@@ -437,6 +453,7 @@ impl<R: Read> StreamReader<R> {
                     path,
                     aux,
                     mtime,
+                    ctime,
                 }));
             }
         }
@@ -542,8 +559,34 @@ mod tests {
         assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].kind, OpKind::Utime);
         assert_eq!(ops[0].mtime, Some((1700000002, 20)));
+        assert_eq!(ops[0].ctime, Some((1700000003, 30)));
         assert_eq!(ops[1].kind, OpKind::Utime);
         assert_eq!(ops[1].mtime, None);
+        assert_eq!(ops[1].ctime, None);
+    }
+
+    #[test]
+    fn set_times_with_undecodable_ctime_yields_none() {
+        fn timespec(sec: i64, nsec: u32) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&sec.to_le_bytes());
+            v.extend_from_slice(&nsec.to_le_bytes());
+            v
+        }
+        // A ctime attribute of the wrong length is not a
+        // timespec the parser can vouch for: it must decode to
+        // None (the resolver then cannot use the ctime proof),
+        // while the well-formed mtime still decodes.
+        let mut st = Vec::new();
+        st.extend(attr(ATTR_PATH, b"dir/f.bin"));
+        st.extend(attr(ATTR_CTIME, &[1u8, 2, 3]));
+        st.extend(attr(ATTR_MTIME, &timespec(1700000002, 20)));
+        let data = stream(&[(CMD_SET_TIMES, st)]);
+        let mut r = StreamReader::new(Cursor::new(data)).unwrap();
+        let ops = r.read_all().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].ctime, None);
+        assert_eq!(ops[0].mtime, Some((1700000002, 20)));
     }
 
     #[test]

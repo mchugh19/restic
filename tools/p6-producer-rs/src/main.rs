@@ -33,6 +33,7 @@ mod parse;
 mod producer;
 mod resolve;
 mod stream;
+mod subvol;
 
 use std::collections::HashMap;
 use std::env;
@@ -127,7 +128,17 @@ fn cmd_parse(flags: &HashMap<String, String>) -> i32 {
     let events: Vec<String> = outcome
         .events
         .iter()
-        .map(|e| format!("{{\"kind\": \"{}\"}}", e.kind))
+        .map(|e| {
+            if e.path.is_empty() {
+                format!("{{\"kind\": \"{}\"}}", e.kind)
+            } else {
+                format!(
+                    "{{\"kind\": \"{}\", \"path\": \"{}\"}}",
+                    e.kind,
+                    escape_json_bytes(&e.path)
+                )
+            }
+        })
         .collect();
     println!(
         "{{\"changed\": {}, \"deleted\": {}, \"atime_only\": {}, \"version\": {}, \"commands\": {}, \"events\": [{}]}}",

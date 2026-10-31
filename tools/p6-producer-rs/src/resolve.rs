@@ -39,18 +39,38 @@
 //! One deliberate divergence from the reference: the atime-only
 //! filter. A path is atime-only when every stream operation that
 //! implicates it is a set_times record (no create, content,
-//! metadata, link or rename operation) and the mtime carried by
-//! its (last) set_times record equals, to the nanosecond, the
-//! mtime of the same path in the retained snapshot. Atime-only
-//! paths are removed from the changed set and counted separately:
-//! pure access-time updates (a backup's own reads, an integrity
-//! scan walking the tree) are not changes restic needs to hear
-//! about. Every doubt fails toward inclusion: a missing or
-//! undecodable stream mtime, a path absent from the retained
-//! tree, a hardlink sibling reached from a substantive operation,
-//! or any non-utime operation on the path keeps it in the changed
-//! set. A dropped path keeps its parent-tree atime in the next
+//! metadata, link or rename operation) and the change it reports
+//! is proved to be atime movement only. Atime-only paths are
+//! removed from the changed set and counted separately: pure
+//! access-time updates (a backup's own reads, an integrity scan
+//! walking the tree) are not changes restic needs to hear about.
+//! A dropped path keeps its parent-tree atime in the next
 //! snapshot; no other tree fact is affected.
+//!
+//! Two proofs can establish a candidate, tried in this order
+//! (see CTIME_DESIGN.md for the full argument):
+//!   1. The ctime proof (v6, no retained-side lookup at all):
+//!      read-driven atime updates never move an inode's ctime,
+//!      and every metadata change stamps ctime with the moment
+//!      of the change, so a candidate whose set_times ctime is
+//!      strictly older than the retained snapshot's creation
+//!      time cannot have changed inside the interval; the op
+//!      can only be reporting atime movement. The threshold is
+//!      the retained snapshot's own kernel otime, read with its
+//!      uuid via BTRFS_IOC_GET_SUBVOL_INFO (see subvol.rs), and
+//!      the proof is disabled for the whole run whenever that
+//!      threshold is missing or suspect.
+//!   2. The stat proof (the v3/v4 proof, verbatim): the mtime
+//!      carried by the candidate's (last) set_times record
+//!      equals, to the nanosecond, the mtime of the same path
+//!      in the retained snapshot (one lstat).
+//! Every doubt fails toward inclusion: a missing or undecodable
+//! stream ctime or mtime, a ctime inside the interval, an
+//! unavailable threshold, a path absent from the retained tree,
+//! a hardlink sibling reached from a substantive operation, or
+//! any non-utime operation on the path keeps it in the changed
+//! set (or routes it to the stat proof, whose own doubts all
+//! keep it).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -58,9 +78,11 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ino;
 use crate::stream::{Op, OpKind};
+use crate::subvol;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Typ {
@@ -148,6 +170,7 @@ fn retained_name(renames: &RenameSeq, path: &[u8], seq: u64) -> Vec<u8> {
 pub struct Resolver {
     old_root: PathBuf,
     new_root: PathBuf,
+    old_fd: File,
     new_fd: File,
     old_meta: HashMap<Vec<u8>, Option<Meta>>,
     new_meta: HashMap<Vec<u8>, Option<Meta>>,
@@ -155,21 +178,94 @@ pub struct Resolver {
     /// page-clamped inode forces (see fresh_names_by_walk); None
     /// until the first clamped inode appears.
     new_by_ino: Option<HashMap<u64, Vec<Vec<u8>>>>,
+    /// The ctime proof's threshold: the retained snapshot's
+    /// creation time as (seconds, nanoseconds). None = the proof
+    /// is disabled for this run (threshold unavailable or
+    /// suspect, or pinned off); every candidate then takes the
+    /// stat proof, exactly as in v4. Unset until first computed
+    /// (see ctime_threshold); the outer Option is the cache.
+    ctime_threshold: Option<Option<(i64, u32)>>,
+    /// Candidates dropped by the ctime proof in this resolution
+    /// (diagnostics; reported as one aggregate event).
+    ctime_proven: u64,
     pub events: Vec<Event>,
 }
 
 impl Resolver {
     pub fn new(old_root: PathBuf, new_root: PathBuf) -> io::Result<Self> {
+        let old_fd = File::open(&old_root)?;
         let new_fd = File::open(&new_root)?;
         Ok(Resolver {
             old_root,
             new_root,
+            old_fd,
             new_fd,
             old_meta: HashMap::new(),
             new_meta: HashMap::new(),
             new_by_ino: None,
+            ctime_threshold: None,
+            ctime_proven: 0,
             events: Vec::new(),
         })
+    }
+
+    /// Pin the ctime threshold instead of deriving it from the
+    /// retained snapshot (unit tests, which resolve against
+    /// plain temp directories, use this; the lifecycle never
+    /// does). Pinning None disables the ctime proof outright.
+    pub fn set_ctime_threshold(&mut self, threshold: Option<(i64, u32)>) {
+        self.ctime_threshold = Some(threshold);
+    }
+
+    /// The retained snapshot's creation time, the ctime proof's
+    /// threshold, computed once and cached. The value comes from
+    /// the kernel: BTRFS_IOC_GET_SUBVOL_INFO on the retained
+    /// root returns the snapshot's uuid and otime together, so
+    /// the timestamp belongs to exactly the snapshot being
+    /// diffed, whatever lifecycle path produced it.
+    ///
+    /// The proof is disabled (None) whenever anything is off:
+    /// the drill hook P6_NO_CTIME_PROOF is set; either root is
+    /// not a btrfs subvolume the ioctl can describe; the two
+    /// snapshots share a uuid (not a retained/fresh pair); the
+    /// retained otime is not strictly before the fresh otime
+    /// (a wall clock that went backwards between the two
+    /// creations, or a clock too coarse to order them: either
+    /// way the interval's clock cannot be trusted); the
+    /// retained otime is in the future relative to this run's
+    /// clock; or the run's clock cannot be read at all. A
+    /// disabled proof costs one ioctl pair per run and changes
+    /// nothing else: every candidate takes the stat proof.
+    fn ctime_threshold(&mut self) -> Option<(i64, u32)> {
+        if let Some(t) = self.ctime_threshold {
+            return t;
+        }
+        let derived = self.derive_ctime_threshold();
+        self.ctime_threshold = Some(derived);
+        derived
+    }
+
+    fn derive_ctime_threshold(&self) -> Option<(i64, u32)> {
+        if std::env::var_os("P6_NO_CTIME_PROOF").is_some() {
+            return None;
+        }
+        let old = subvol::subvol_info(&self.old_fd).ok()?;
+        let new = subvol::subvol_info(&self.new_fd).ok()?;
+        if old.uuid == new.uuid {
+            return None;
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+        let now = (now.as_secs() as i64, now.subsec_nanos());
+        let strictly_before = |a: (i64, u32), b: (i64, u32)| {
+            a.0 < b.0 || (a.0 == b.0 && a.1 < b.1)
+        };
+        if !strictly_before(old.otime, new.otime) {
+            return None;
+        }
+        if !strictly_before(old.otime, now) && old.otime != now {
+            return None;
+        }
+        Some(old.otime)
     }
 
     fn lstat(root: &Path, rel: &[u8]) -> Option<Meta> {
@@ -374,12 +470,16 @@ impl Resolver {
         let mut deleted: HashSet<Vec<u8>> = HashSet::new();
         let mut moves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         // Atime-filter bookkeeping, keyed by final (fresh) name:
-        // utime_cand holds the stream mtime of the last set_times
-        // record implicating the name (None = the record carried
-        // no decodable mtime); subst holds every name implicated
-        // by any other operation. A changed name present in
-        // utime_cand and absent from subst is a drop candidate.
-        let mut utime_cand: HashMap<Vec<u8>, Option<(i64, u32)>> = HashMap::new();
+        // utime_cand holds the (mtime, ctime) pair of the last
+        // set_times record implicating the name (each None = the
+        // record carried no decodable attribute of that kind);
+        // subst holds every name implicated by any other
+        // operation. A changed name present in utime_cand and
+        // absent from subst is a drop candidate.
+        let mut utime_cand: HashMap<
+            Vec<u8>,
+            (Option<(i64, u32)>, Option<(i64, u32)>),
+        > = HashMap::new();
         let mut subst: HashSet<Vec<u8>> = HashSet::new();
 
         for op in ops {
@@ -402,7 +502,7 @@ impl Resolver {
                     // difference is the candidacy record (and the
                     // absence of a substantive mark).
                     let f = final_name(&renames, path, op.seq);
-                    utime_cand.insert(f.clone(), op.mtime);
+                    utime_cand.insert(f.clone(), (op.mtime, op.ctime));
                     if self.in_new(&f) {
                         changed_inode.insert(f);
                     } else if !is_temp(&f) && !is_temp(path) {
@@ -471,18 +571,19 @@ impl Resolver {
         // bookkeeping follows the same propagation: a name reached
         // from a substantive operation is substantive; a name
         // reached only from a utime candidate inherits the
-        // candidacy (same inode, hence same mtime).
+        // candidacy (same inode, hence the same mtime and ctime:
+        // both proofs are per-inode facts).
         let mut expanded: HashSet<Vec<u8>> = HashSet::new();
         for p in &changed_inode {
             expanded.insert(p.clone());
             if let Some(m) = self.meta_new(p) {
                 if m.typ == Typ::File && m.nlink > 1 {
-                    let cand_mtime = utime_cand.get(p).copied();
+                    let cand_times = utime_cand.get(p).copied();
                     for name in self.fresh_names_of_inode(m.ino)? {
                         if subst.contains(p) {
                             subst.insert(name.clone());
-                        } else if let Some(mt) = cand_mtime {
-                            utime_cand.entry(name.clone()).or_insert(mt);
+                        } else if let Some(times) = cand_times {
+                            utime_cand.entry(name.clone()).or_insert(times);
                         }
                         expanded.insert(name);
                     }
@@ -533,10 +634,22 @@ impl Resolver {
         // whose implicating operations were all set_times records
         // (present in utime_cand, absent from subst) and which is
         // not positionally changed. It is dropped only on positive
-        // proof: the stream mtime exists and equals the retained
-        // tree's mtime for the same path to the nanosecond. Every
-        // other outcome (no stream mtime, no retained path, mtimes
-        // apart) keeps the name in the changed set.
+        // proof, tried in order:
+        //   1. ctime proof: the record's ctime exists and is
+        //      strictly older than the retained snapshot's
+        //      creation time (the threshold). No metadata change
+        //      can have happened inside the interval (it would
+        //      have stamped ctime inside it), and read-driven
+        //      atime updates never move ctime, so the op can
+        //      only be reporting atime movement. No retained
+        //      lookup happens for such a candidate.
+        //   2. stat proof (v3/v4, verbatim): the stream mtime
+        //      exists and equals the retained tree's mtime for
+        //      the same path to the nanosecond.
+        // Equality of ctime and threshold is ambiguous and falls
+        // through, as do a missing ctime, a disabled threshold
+        // and every stat-proof doubt: the name stays in the
+        // changed set unless a proof is positive.
         let mut atime_only: u64 = 0;
         if !utime_cand.is_empty() {
             let candidates: Vec<Vec<u8>> = changed
@@ -548,17 +661,49 @@ impl Resolver {
                 })
                 .cloned()
                 .collect();
+            let had_candidates = !candidates.is_empty();
             for p in candidates {
-                let stream_mtime = utime_cand.get(&p).copied().flatten();
-                let proven = match (stream_mtime, self.meta_old(&p)) {
-                    (Some((sec, nsec)), Some(m)) => {
-                        m.mtime.0 == sec && m.mtime.1 == nsec as i64
+                let (stream_mtime, stream_ctime) = utime_cand
+                    .get(&p)
+                    .copied()
+                    .unwrap_or((None, None));
+                let mut proven = false;
+                if let (Some(ct), Some(thr)) =
+                    (stream_ctime, self.ctime_threshold())
+                {
+                    if ct.0 < thr.0 || (ct.0 == thr.0 && ct.1 < thr.1) {
+                        proven = true;
+                        self.ctime_proven += 1;
                     }
-                    _ => false,
-                };
+                }
+                if !proven {
+                    proven = match (stream_mtime, self.meta_old(&p)) {
+                        (Some((sec, nsec)), Some(m)) => {
+                            m.mtime.0 == sec && m.mtime.1 == nsec as i64
+                        }
+                        _ => false,
+                    };
+                }
                 if proven {
                     changed.remove(&p);
                     atime_only += 1;
+                }
+            }
+            if had_candidates {
+                // One aggregate diagnostic per resolution, in the
+                // style of the other events: how many drops the
+                // ctime proof carried, or that it was disabled and
+                // every proof was a stat.
+                if self.ctime_threshold().is_some() {
+                    self.events.push(Event {
+                        kind: "ctime-proof",
+                        path: self.ctime_proven.to_string().into_bytes(),
+                    });
+                } else {
+                    self.events.push(Event {
+                        kind: "ctime-proof-disabled",
+                        path: Vec::new(),
+                    });
                 }
             }
         }
@@ -622,6 +767,23 @@ mod tests {
             path: path.as_bytes().to_vec(),
             aux: None,
             mtime,
+            ctime: None,
+        }
+    }
+
+    fn op_ctime(
+        seq: u64,
+        path: &str,
+        mtime: Option<(i64, u32)>,
+        ctime: Option<(i64, u32)>,
+    ) -> Op {
+        Op {
+            seq,
+            kind: OpKind::Utime,
+            path: path.as_bytes().to_vec(),
+            aux: None,
+            mtime,
+            ctime,
         }
     }
 
@@ -629,6 +791,187 @@ mod tests {
         let mut r = Resolver::new(old.to_path_buf(), new.to_path_buf()).unwrap();
         let (changed, _deleted, atime_only) = r.resolve(ops).unwrap();
         (changed, atime_only)
+    }
+
+    /// Resolve with the ctime threshold pinned (the temp trees
+    /// are not btrfs, so auto-derivation would disable the
+    /// proof). Returns the changed set, the atime_only count and
+    /// the resolver's events, whose ctime-proof aggregate carries
+    /// its drop count in the path field.
+    fn resolve_pinned(
+        old: &Path,
+        new: &Path,
+        ops: &[Op],
+        threshold: Option<(i64, u32)>,
+    ) -> (HashSet<Vec<u8>>, u64, Vec<Event>) {
+        let mut r = Resolver::new(old.to_path_buf(), new.to_path_buf()).unwrap();
+        r.set_ctime_threshold(threshold);
+        let (changed, _deleted, atime_only) = r.resolve(ops).unwrap();
+        (changed, atime_only, r.events)
+    }
+
+    fn ctime_event(events: &[Event], kind: &str) -> Option<String> {
+        events
+            .iter()
+            .find(|e| e.kind == kind)
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+    }
+
+    // The pinned threshold for the ctime tests: the fixture
+    // files' fixed mtime is 1_700_000_000.123456789 (see put()).
+    const THR: (i64, u32) = (1_700_000_100, 0);
+    const CT_OLD: (i64, u32) = (1_700_000_050, 0); // before THR
+    const CT_IN: (i64, u32) = (1_700_000_150, 0); // inside interval
+
+    #[test]
+    fn ctime_proof_drops_when_ctime_predates_retained() {
+        let (old, new) = temp_tree("ctimedrop");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        // The stream mtime deliberately disagrees with the
+        // retained tree: the stat proof alone would keep this
+        // path. The ctime proof is what drops it (its content:
+        // no metadata change can have happened inside the
+        // interval, so a real stream of this shape cannot carry
+        // a moved mtime; the combination is the proof's whole
+        // point, and the clock assumptions are CTIME_DESIGN.md's).
+        let (sec, nsec) = mtime_of(&old, "f.bin");
+        let (changed, atime_only, events) = resolve_pinned(
+            &old,
+            &new,
+            &[op_ctime(1, "f.bin", Some((sec + 5, nsec)), Some(CT_OLD))],
+            Some(THR),
+        );
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        assert_eq!(atime_only, 1);
+        assert_eq!(
+            ctime_event(&events, "ctime-proof").as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn ctime_equal_to_threshold_falls_through_to_stat() {
+        let (old, new) = temp_tree("ctimeequal");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        // ctime == threshold is ambiguous (a change stamped in
+        // the retained snapshot's own creation instant): the
+        // ctime proof must not fire; the stat proof drops the
+        // path because the mtime did not move.
+        let mt = mtime_of(&old, "f.bin");
+        let (changed, atime_only, events) = resolve_pinned(
+            &old,
+            &new,
+            &[op_ctime(1, "f.bin", Some(mt), Some(THR))],
+            Some(THR),
+        );
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        assert_eq!(atime_only, 1);
+        assert_eq!(
+            ctime_event(&events, "ctime-proof").as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn ctime_inside_interval_stat_governs_both_ways() {
+        // (a) mtime moved: kept, by the stat proof.
+        let (old, new) = temp_tree("ctimeinkept");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let (sec, nsec) = mtime_of(&old, "f.bin");
+        let (changed, atime_only, events) = resolve_pinned(
+            &old,
+            &new,
+            &[op_ctime(1, "f.bin", Some((sec + 5, nsec)), Some(CT_IN))],
+            Some(THR),
+        );
+        assert!(changed.contains(b"f.bin".as_slice()));
+        assert_eq!(atime_only, 0);
+        assert_eq!(
+            ctime_event(&events, "ctime-proof").as_deref(),
+            Some("0")
+        );
+        // (b) mtime unmoved (the deliberate utimensat atime set):
+        // dropped, by the stat proof, not the ctime proof.
+        let (old, new) = temp_tree("ctimeindrop");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let mt = mtime_of(&old, "f.bin");
+        let (changed, atime_only, events) = resolve_pinned(
+            &old,
+            &new,
+            &[op_ctime(1, "f.bin", Some(mt), Some(CT_IN))],
+            Some(THR),
+        );
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        assert_eq!(atime_only, 1);
+        assert_eq!(
+            ctime_event(&events, "ctime-proof").as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn missing_ctime_falls_through_to_stat() {
+        let (old, new) = temp_tree("ctimemissing");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        let mt = mtime_of(&old, "f.bin");
+        // No ctime on the record: threshold or not, the verdict
+        // is the stat proof's (drop here, mtime unmoved).
+        let (changed, atime_only, events) = resolve_pinned(
+            &old,
+            &new,
+            &[op_ctime(1, "f.bin", Some(mt), None)],
+            Some(THR),
+        );
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        assert_eq!(atime_only, 1);
+        assert_eq!(
+            ctime_event(&events, "ctime-proof").as_deref(),
+            Some("0")
+        );
+        // And with the mtime moved, the same shape is kept.
+        let (changed, atime_only, _) = resolve_pinned(
+            &old,
+            &new,
+            &[op_ctime(1, "f.bin", Some((mt.0 + 5, mt.1)), None)],
+            Some(THR),
+        );
+        assert!(changed.contains(b"f.bin".as_slice()));
+        assert_eq!(atime_only, 0);
+    }
+
+    #[test]
+    fn disabled_threshold_falls_through_to_stat() {
+        let (old, new) = temp_tree("ctimedisabled");
+        put(&old, "f.bin");
+        put(&new, "f.bin");
+        // Threshold pinned off: even a pre-retained ctime proves
+        // nothing, so the moved mtime keeps the path...
+        let (sec, nsec) = mtime_of(&old, "f.bin");
+        let (changed, atime_only, events) = resolve_pinned(
+            &old,
+            &new,
+            &[op_ctime(1, "f.bin", Some((sec + 5, nsec)), Some(CT_OLD))],
+            None,
+        );
+        assert!(changed.contains(b"f.bin".as_slice()));
+        assert_eq!(atime_only, 0);
+        assert!(ctime_event(&events, "ctime-proof-disabled").is_some());
+        assert!(ctime_event(&events, "ctime-proof").is_none());
+        // ...and the unmoved mtime still drops it, by stat.
+        let mt = mtime_of(&old, "f.bin");
+        let (changed, atime_only, _) = resolve_pinned(
+            &old,
+            &new,
+            &[op_ctime(1, "f.bin", Some(mt), Some(CT_OLD))],
+            None,
+        );
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        assert_eq!(atime_only, 1);
     }
 
     #[test]

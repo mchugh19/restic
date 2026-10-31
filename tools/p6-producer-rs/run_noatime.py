@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -88,7 +89,7 @@ def read_set(path):
     return set(x.decode("utf-8", "surrogateescape") for x in lines)
 
 
-def produce_rs(root, retained, fresh, work):
+def produce_rs(root, retained, fresh, work, env_extra=None):
     os.makedirs(work, exist_ok=True)
     stream = os.path.join(work, "stream.bin")
     changed_f = os.path.join(work, "rs.changed")
@@ -101,11 +102,17 @@ def produce_rs(root, retained, fresh, work):
                         "-p", retained, fresh],
                        check=True, stdout=f, stderr=subprocess.PIPE)
     t2 = time.time()
-    p = subprocess.run(["sudo", RS_BIN, "parse", "--stream", stream,
-                        "--retained", retained, "--fresh", fresh,
-                        "--changed-out", changed_f,
-                        "--deleted-out", deleted_f],
-                       capture_output=True, text=True)
+    # env_extra goes through `sudo env`: sudo's env_reset would
+    # otherwise strip drill-hook variables (P6_NO_CTIME_PROOF)
+    # before the producer ever saw them.
+    argv = ["sudo"]
+    if env_extra:
+        argv += ["env"] + [f"{k}={v}" for k, v in env_extra.items()]
+    argv += [RS_BIN, "parse", "--stream", stream,
+             "--retained", retained, "--fresh", fresh,
+             "--changed-out", changed_f,
+             "--deleted-out", deleted_f]
+    p = subprocess.run(argv, capture_output=True, text=True)
     t3 = time.time()
     if p.returncode != 0:
         raise RuntimeError(f"rust parse failed rc={p.returncode}: "
@@ -129,13 +136,15 @@ def gt_atime_class(old, new, gt_c):
     return out
 
 
-def cycle(case_dir, root, retained, fresh, label, apply_fn):
+def cycle(case_dir, root, retained, fresh, label, apply_fn,
+          env_extra=None):
     work = os.path.join(case_dir, "work")
     old = treediff.walk(retained, hash_content=True)
     oplog = []
     apply_fn(oplog)
     t0 = time.time()
-    p_c, p_d, events, ao, timings = produce_rs(root, retained, fresh, work)
+    p_c, p_d, events, ao, timings = produce_rs(root, retained, fresh,
+                                               work, env_extra)
     new = treediff.walk(fresh, hash_content=True)
     gt_c, gt_d, _detail = treediff.diff(old, new)
     gt_ao = gt_atime_class(old, new, gt_c)
@@ -157,6 +166,8 @@ def cycle(case_dir, root, retained, fresh, label, apply_fn):
         "omissions_changed": missing_c, "extras_changed": extra_c,
         "omissions_deleted": missing_d, "extras_deleted": extra_d,
         "unknown_commands": unknown,
+        "events": events,
+        "p_changed_list": sorted(p_c),
         "timings": timings, "cycle_wall_s": round(time.time() - t0, 2),
     }
     chain(case_dir, root, retained, fresh)
@@ -225,10 +236,148 @@ def run_random(base, out, batches, ops_per_batch, seed0=777):
     print(f"random phase complete: {total_ops} ops applied", flush=True)
 
 
+# ----------------------------------------------------------------------
+# The v6 ctime traps. Five dedicated cycles pinning the ctime
+# proof's semantics against the tightened ground truth AND against
+# the producer's own diagnostic events:
+#   1. a read sweep over pre-retained files: every drop must be
+#      carried by the ctime proof (aggregate event == dropped);
+#   2. an mtime-only touch inside the interval: ctime is inside
+#      the interval, the stat proof keeps it (mtime moved);
+#   3. a deliberate utimensat atime-only set inside the interval:
+#      dropped by the stat proof, ctime aggregate stays 0;
+#   4. a chmod inside the interval: substantive op, kept, and not
+#      a candidate at all;
+#   5. the same read sweep with P6_NO_CTIME_PROOF=1: the verdict
+#      must equal the enabled run's exactly, with the
+#      ctime-proof-disabled event present instead.
+# The fixture files were created before the retained snapshot, so
+# their ctimes predate the threshold: the baseline read sweep in
+# cycle 1 exercises the proof the way production does.
+
+def ctime_event(events, kind):
+    for e in events:
+        if e.get("kind") == kind:
+            return e.get("path")
+    return None
+
+
+def ctime_traps(workdir, out):
+    case = os.path.join(workdir, "ctime-traps")
+    root = os.path.join(case, "root")
+    retained = os.path.join(case, "retained")
+    fresh = os.path.join(case, "fresh")
+    if os.path.isdir(case):
+        # Remove every subvolume in the case dir (read-only
+        # snapshots defeat plain rmtree), then the husk.
+        for name in os.listdir(case):
+            p = os.path.join(case, name)
+            if os.path.isdir(p):
+                subprocess.run(["sudo", "btrfs", "subvolume",
+                                "delete", p], capture_output=True)
+        _run(["sudo", "rm", "-rf", case])
+    os.makedirs(case)
+    _run(["sudo", "btrfs", "subvolume", "create", root])
+    _run(["sudo", "chown", "ubuntu:ubuntu", root])
+    for d in range(40):
+        dp = os.path.join(root, f"dir{d:02d}")
+        os.makedirs(dp)
+        for f in range(25):
+            p = os.path.join(dp, f"f{f:02d}.txt")
+            with open(p, "w") as fh:
+                fh.write(f"trap content {d}/{f}\n" * 3)
+    sh_snapshot(root, retained)
+
+    def make_sweep(lo, hi):
+        def sweep_reads(oplog):
+            n = 0
+            for d in range(lo, hi):
+                dp = os.path.join(root, f"dir{d:02d}")
+                for name in sorted(os.listdir(dp)):
+                    with open(os.path.join(dp, name), "rb") as fh:
+                        fh.read(1)
+                    n += 1
+            oplog.append(f"read-sweep dirs {lo}..{hi - 1} x{n}")
+        return sweep_reads
+
+    # First half of the tree, proof enabled.
+    res = cycle(case, root, retained, fresh, "ctime:read-sweep",
+                make_sweep(0, 20))
+    assert res["verdict"] == "PASS", res
+    assert res["p_atime_only"] > 0, res
+    assert ctime_event(res["events"], "ctime-proof") == \
+        str(res["p_atime_only"]), res["events"]
+    res["trap_asserts"] = {"all_drops_ctime_proven": True}
+    emit(res, out)
+
+    def mtime_touch(oplog):
+        p = os.path.join(root, "dir03", "f07.txt")
+        st = os.lstat(p)
+        os.utime(p, ns=(st.st_atime_ns,
+                        st.st_mtime_ns + 3_000_000_000_000))
+        oplog.append("mtime-only touch (ctime inside interval)")
+
+    res = cycle(case, root, retained, fresh, "ctime:mtime-touch",
+                mtime_touch)
+    assert res["verdict"] == "PASS", res
+    assert "dir03/f07.txt" in res["p_changed_list"], res
+    assert ctime_event(res["events"], "ctime-proof") == "0"
+    res["trap_asserts"] = {"kept_by_stat": True, "ctime_proven": "0"}
+    emit(res, out)
+
+    def utimensat_atime(oplog):
+        p = os.path.join(root, "dir05", "f11.txt")
+        st = os.lstat(p)
+        os.utime(p, ns=(time.time_ns(), st.st_mtime_ns))
+        oplog.append("utimensat atime-only (ctime inside interval)")
+
+    res = cycle(case, root, retained, fresh, "ctime:utimensat",
+                utimensat_atime)
+    assert res["verdict"] == "PASS", res
+    assert res["p_atime_only"] >= 1, res
+    assert ctime_event(res["events"], "ctime-proof") == "0"
+    res["trap_asserts"] = {"dropped_by_stat": True, "ctime_proven": "0"}
+    emit(res, out)
+
+    def chmod_trap(oplog):
+        p = os.path.join(root, "dir07", "f03.txt")
+        os.chmod(p, 0o600)
+        oplog.append("chmod (substantive)")
+
+    res = cycle(case, root, retained, fresh, "ctime:chmod", chmod_trap)
+    assert res["verdict"] == "PASS", res
+    assert "dir07/f03.txt" in res["p_changed_list"], res
+    res["trap_asserts"] = {"kept_substantive": True}
+    emit(res, out)
+
+    # Second half of the tree (never read before, so its atimes
+    # are still stale), proof disabled by the drill hook: the
+    # same drops must happen, all by the stat proof, with the
+    # disabled event present. The tightened GT verdict already
+    # pins the changed set exactly; gt_atime_class is the count
+    # of atime-class paths the sweep produced.
+    res = cycle(case, root, retained, fresh, "ctime:sweep-disabled",
+                make_sweep(20, 40),
+                env_extra={"P6_NO_CTIME_PROOF": "1"})
+    assert res["verdict"] == "PASS", res
+    assert res["p_atime_only"] > 0, res
+    assert res["p_atime_only"] == res["gt_atime_class"], res
+    # The disabled event carries no path field, so presence is
+    # checked by kind, not via ctime_event's return value.
+    kinds = [e.get("kind") for e in res["events"]]
+    assert "ctime-proof-disabled" in kinds, res["events"]
+    assert "ctime-proof" not in kinds, res["events"]
+    res["trap_asserts"] = {"disabled_event": True,
+                           "drops_equal_gt_atime_class": True}
+    emit(res, out)
+    print("ctime traps complete", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workdir", default="/data/p6/noatime")
-    ap.add_argument("--mode", choices=["matrix", "random", "all"],
+    ap.add_argument("--mode", choices=["matrix", "random", "ctime",
+                                       "all"],
                     default="all")
     ap.add_argument("--batches", type=int, default=40)
     ap.add_argument("--ops-per-batch", type=int, default=150)
@@ -240,6 +389,8 @@ def main():
     with open(results_path, "a") as out:
         if args.mode in ("matrix", "all"):
             run_matrix(args.workdir, out)
+        if args.mode in ("ctime", "all"):
+            ctime_traps(args.workdir, out)
         if args.mode in ("random", "all"):
             run_random(args.workdir, out, args.batches,
                        args.ops_per_batch)
